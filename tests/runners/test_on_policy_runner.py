@@ -25,7 +25,12 @@ IMG_C, IMG_H, IMG_W = 1, 16, 16
 class DummyEnv(VecEnv):
     """Minimal VecEnv that returns random observations and rewards."""
 
-    def __init__(self, device: str = "cpu", include_image: bool = False) -> None:  # noqa: D107
+    def __init__(
+        self,
+        device: str = "cpu",
+        include_image: bool = False,
+        legacy_format: bool = False,
+    ) -> None:  # noqa: D107
         self.num_envs = NUM_ENVS
         self.num_actions = NUM_ACTIONS
         self.max_episode_length = MAX_EP_LEN
@@ -33,20 +38,32 @@ class DummyEnv(VecEnv):
         self.device = device
         self.cfg = {}
         self._include_image = include_image
+        self._legacy_format = legacy_format
 
-    def get_observations(self) -> TensorDict:  # noqa: D102
+    def _make_observations(self) -> TensorDict:
         data: dict = {"policy": torch.randn(self.num_envs, OBS_DIM, device=self.device)}
         if self._include_image:
             data["image"] = torch.randn(self.num_envs, IMG_C, IMG_H, IMG_W, device=self.device)
         return TensorDict(data, batch_size=[self.num_envs], device=self.device)
 
-    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:  # noqa: D102
+    def get_observations(self) -> TensorDict | tuple[torch.Tensor, dict]:  # noqa: D102
+        obs = self._make_observations()
+        if self._legacy_format:
+            return obs["policy"], {"observations": dict(obs.items())}
+        return obs
+
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict | torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         self.episode_length_buf += 1
         dones = (self.episode_length_buf >= self.max_episode_length).float()
         self.episode_length_buf[dones.bool()] = 0
-        obs = self.get_observations()
+        obs = self._make_observations()
         rewards = torch.randn(self.num_envs, device=self.device)
-        extras = {"time_outs": torch.zeros(self.num_envs, device=self.device)}
+        extras = {
+            "observations": dict(obs.items()),
+            "time_outs": torch.zeros(self.num_envs, device=self.device),
+        }
+        if self._legacy_format:
+            return obs["policy"], rewards, dones, extras
         return obs, rewards, dones, extras
 
 
@@ -126,9 +143,13 @@ def _make_train_cfg(model_type: str = "mlp") -> dict:
     return cfg
 
 
-def _build_runner(log_dir: str | None = None, model_type: str = "mlp") -> OnPolicyRunner:
+def _build_runner(
+    log_dir: str | None = None,
+    model_type: str = "mlp",
+    legacy_format: bool = False,
+) -> OnPolicyRunner:
     """Construct a runner with a DummyEnv and minimal config."""
-    env = DummyEnv(include_image=(model_type == "cnn"))
+    env = DummyEnv(include_image=(model_type == "cnn"), legacy_format=legacy_format)
     cfg = _make_train_cfg(model_type)
     return OnPolicyRunner(env, cfg, log_dir=log_dir, device="cpu")
 
@@ -156,6 +177,11 @@ class TestLearnLoop:
         """A short learn call should complete without raising."""
         runner = _build_runner()
         runner.learn(num_learning_iterations=2)
+
+    def test_learn_accepts_legacy_policy_obs_extras_format(self) -> None:
+        """A short learn call should accept IsaacLab 2.1 style ``(policy_obs, extras)`` observations."""
+        runner = _build_runner(legacy_format=True)
+        runner.learn(num_learning_iterations=1)
 
     def test_learn_updates_parameters(self) -> None:
         """Actor parameters should change after a learning iteration."""

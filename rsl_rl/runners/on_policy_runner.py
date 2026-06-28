@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 import torch
+from tensordict import TensorDict
 
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
@@ -33,7 +34,7 @@ class OnPolicyRunner:
         self._configure_multi_gpu()
 
         # Query observations from the environment for algorithm construction
-        obs = self.env.get_observations()
+        obs, _ = self._get_observations()
 
         # Create the algorithm
         alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
@@ -62,7 +63,8 @@ class OnPolicyRunner:
             )
 
         # Start learning
-        obs = self.env.get_observations().to(self.device)
+        obs, _ = self._get_observations()
+        obs = obs.to(self.device)
         self.alg.train_mode()  # switch to train mode (for dropout for example)
 
         # Ensure all parameters are in-synced
@@ -84,7 +86,7 @@ class OnPolicyRunner:
                     # Sample actions
                     actions = self.alg.act(obs)
                     # Step the environment
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones, extras = self._step(actions.to(self.env.device))
                     # Check for NaN values from the environment
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
@@ -203,6 +205,35 @@ class OnPolicyRunner:
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""
         self.logger.git_status_repos.append(repo_file_path)
+
+    def _get_observations(self) -> tuple[TensorDict, dict]:
+        """Get observations while accepting current and IsaacLab 2.1 wrapper formats."""
+        result = self.env.get_observations()
+        if isinstance(result, tuple):
+            obs, extras = result
+        else:
+            obs, extras = result, {}
+        return self._to_tensordict(obs, extras), extras
+
+    def _step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        """Step the environment while accepting current and IsaacLab 2.1 wrapper formats."""
+        obs, rewards, dones, extras = self.env.step(actions)
+        return self._to_tensordict(obs, extras), rewards, dones, extras
+
+    def _to_tensordict(self, obs: TensorDict | torch.Tensor | dict, extras: dict) -> TensorDict:
+        """Convert legacy observations to TensorDict."""
+        if isinstance(obs, TensorDict):
+            return obs
+        if isinstance(obs, dict):
+            return TensorDict(obs, batch_size=[self.env.num_envs], device=self.env.device)
+
+        data = {"policy": obs}
+        observations = extras.get("observations", {})
+        if isinstance(observations, dict):
+            for key, value in observations.items():
+                if key != "policy":
+                    data[key] = value
+        return TensorDict(data, batch_size=[self.env.num_envs], device=self.env.device)
 
     def _configure_multi_gpu(self) -> None:
         """Configure multi-gpu training."""

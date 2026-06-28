@@ -5,6 +5,7 @@
 
 """Helper functions."""
 
+from .amp_loader import AMPLoader
 from .log_writer import LogWriter
 from .neptune_log_writer import NeptuneLogWriter
 from .utils import (
@@ -21,6 +22,7 @@ from .utils import (
 from .wandb_log_writer import WandbLogWriter
 
 __all__ = [
+    "AMPLoader",
     "LogWriter",
     "NeptuneLogWriter",
     "WandbLogWriter",
