@@ -6,6 +6,7 @@
 """Building blocks for neural models."""
 
 from .cnn import CNN
+
 from .discriminator import Discriminator
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
