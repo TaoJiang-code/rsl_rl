@@ -37,6 +37,7 @@ class CNNModel(MLPModel):
         distribution_cfg: dict | None = None,
         cnn_cfg: dict[str, dict] | dict[str, Any] | None = None,
         cnns: nn.ModuleDict | dict[str, nn.Module] | None = None,
+        last_activation: str | None = None,
     ) -> None:
         """Initialize the CNN-based model.
 
@@ -51,6 +52,7 @@ class CNNModel(MLPModel):
             distribution_cfg: Configuration dictionary for the output distribution.
             cnn_cfg: Configuration of the CNN encoder(s).
             cnns: CNN modules to use, e.g., for sharing CNNs between actor and critic. If None, new CNNs are created.
+            last_activation: Optional activation function applied to the final CNN-MLP output.
         """
         # Resolve observation groups and dimensions
         self._get_obs_dim(obs, obs_groups, obs_set)
@@ -88,14 +90,15 @@ class CNNModel(MLPModel):
 
         # Initialize the parent MLP model
         super().__init__(
-            obs,
-            obs_groups,
-            obs_set,
-            output_dim,
-            hidden_dims,
-            activation,
-            obs_normalization,
-            distribution_cfg,
+            obs=obs,
+            obs_groups=obs_groups,
+            obs_set=obs_set,
+            output_dim=output_dim,
+            hidden_dims=hidden_dims,
+            activation=activation,
+            obs_normalization=obs_normalization,
+            distribution_cfg=distribution_cfg,
+            last_activation=last_activation,
         )
 
         # Register CNN encoders

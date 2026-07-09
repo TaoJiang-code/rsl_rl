@@ -10,6 +10,7 @@ from .cnn import CNN
 from .discriminator import Discriminator
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
+from .moe import MoELayer
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .rnn import RNN, HiddenState
 
@@ -17,6 +18,7 @@ __all__ = [
     "CNN",
     "Discriminator",
     "MLP",
+    "MoELayer",
     "RNN",
     "BetaDistribution",
     "Distribution",

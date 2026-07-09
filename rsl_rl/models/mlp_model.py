@@ -37,6 +37,7 @@ class MLPModel(nn.Module):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
+        last_activation: str | None = None,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -50,6 +51,7 @@ class MLPModel(nn.Module):
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
+            last_activation: Optional activation function applied after the final MLP layer.
         """
         super().__init__()
 
@@ -73,7 +75,7 @@ class MLPModel(nn.Module):
             mlp_output_dim = output_dim
 
         # MLP
-        self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation, last_activation)
 
         # Initialize distribution-specific MLP weights
         if self.distribution is not None:
