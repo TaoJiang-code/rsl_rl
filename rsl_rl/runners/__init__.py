@@ -8,6 +8,7 @@
 from .amp_on_policy_runner import AmpOnPolicyRunner
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
 from .distillation_runner import DistillationRunner
+from .parkour_on_policy_runner import ParkourOnPolicyRunner
 
 
-__all__ = ["AmpOnPolicyRunner", "DistillationRunner", "OnPolicyRunner"]
+__all__ = ["AmpOnPolicyRunner", "DistillationRunner", "OnPolicyRunner", "ParkourOnPolicyRunner"]
