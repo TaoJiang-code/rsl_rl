@@ -6,6 +6,7 @@
 """Building blocks for neural models."""
 
 from .cnn import CNN
+from .context_vae import ContextVAE, ContextVAEOutput
 
 from .discriminator import Discriminator
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
@@ -16,6 +17,8 @@ from .rnn import RNN, HiddenState
 
 __all__ = [
     "CNN",
+    "ContextVAE",
+    "ContextVAEOutput",
     "Discriminator",
     "MLP",
     "MoELayer",
