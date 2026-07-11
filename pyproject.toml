@@ -25,14 +25,14 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch>=2.6.0",
-    "torchvision>=0.5.0",
+    "torch==2.5.1",
+    "torchvision==0.20.1",
     "tensordict>=0.7.0",
-    "numpy>=1.16.4",
-    "tensorboard",
+    "numpy==1.26.0",
+    "tensorboard==2.19.0",
     "GitPython",
-    "onnx",
-    "onnxscript>=0.5.4",
+    "onnx==1.16.1",
+    "onnxscript==0.5.4",
 ]
 
 [project.urls]
