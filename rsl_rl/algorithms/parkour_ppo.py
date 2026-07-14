@@ -183,6 +183,7 @@ class ParkourPPO(PPO):
         self.mmp_rewards: torch.Tensor | None = None
         self.style_rewards: torch.Tensor | None = None
         self.mmp_scores: torch.Tensor | None = None
+        self._mmp_obs_stats: dict[str, float] = {}
 
         self.cnn = self._raw_actor.cnn
         self.critic_cnn = self._raw_critic.cnn
@@ -203,6 +204,18 @@ class ParkourPPO(PPO):
         """Store PPO transitions using MMP rewards computed from environment-fed expert observations."""
         policy_obs = self._first_discriminator.get_policy_obs(obs, flatten_history_dim=False)
         expert_obs = self._first_discriminator.get_expert_obs(obs, flatten_history_dim=False)
+        with torch.no_grad():
+            self._mmp_obs_stats = {
+                "mmp_policy_obs_mean": policy_obs.mean().item(),
+                "mmp_policy_obs_std": policy_obs.std().item(),
+                "mmp_expert_obs_mean": expert_obs.mean().item(),
+                "mmp_expert_obs_std": expert_obs.std().item(),
+                "mmp_obs_abs_diff_all": (policy_obs - expert_obs).abs().mean().item(),
+                "mmp_obs_abs_diff_first": (policy_obs[:, 0] - expert_obs[:, 0]).abs().mean().item(),
+                "mmp_obs_abs_diff_last": (policy_obs[:, -1] - expert_obs[:, 0]).abs().mean().item(),
+                "mmp_obs_abs_max_policy": policy_obs.abs().max().item(),
+                "mmp_obs_abs_max_expert": expert_obs.abs().max().item(),
+            }
         mmp_ids = _get_mmp_ids(obs, self.mmp_id_obs_group)
         known_id_mask = torch.zeros_like(mmp_ids, dtype=torch.bool)
         for disc_id in self.discriminator_ids:
@@ -375,6 +388,7 @@ class ParkourPPO(PPO):
             "mmp_expert_pred": mean_expert_pred / num_updates,
             "mmp_reward_coef": self.mmp_reward_coef,
         }
+        loss_dict.update(self._mmp_obs_stats)
         if mean_rnd_loss is not None:
             loss_dict["rnd"] = mean_rnd_loss / num_updates
         if mean_symmetry_loss is not None:
