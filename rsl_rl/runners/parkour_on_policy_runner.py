@@ -9,11 +9,11 @@ import torch.nn as nn
 
 from rsl_rl.algorithms import ParkourPPO
 from rsl_rl.env import VecEnv
-from rsl_rl.runners.on_policy_runner import OnPolicyRunner
+from rsl_rl.runners.amp_on_policy_runner import AmpOnPolicyRunner
 
 
-class ParkourOnPolicyRunner(OnPolicyRunner):
-    """On-policy runner for CNN-MoE parkour policies trained with MMP rewards."""
+class ParkourOnPolicyRunner(AmpOnPolicyRunner):
+    """On-policy runner for CNN-MoE parkour policies trained with AMP rewards."""
 
     alg: ParkourPPO
     """The parkour PPO algorithm."""
