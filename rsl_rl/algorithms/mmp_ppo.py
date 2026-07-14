@@ -31,6 +31,8 @@ class MMPPPO(PPO):
         disc_expert_obs_buffer: CircularBuffer,
         mmp_loss_coef: float = 1.0,
         mmp_grad_penalty_coef: float = 10.0,
+        mmp_reward_coef: float = 1.0,
+        task_reward_coef: float = 1.0,
         discriminator_learning_rate: float | None = None,
         discriminator_optimizer: str = "adam",
         discriminator_max_grad_norm: float | None = None,
@@ -46,6 +48,8 @@ class MMPPPO(PPO):
         self.disc_expert_obs_buffer = disc_expert_obs_buffer
         self.mmp_loss_coef = mmp_loss_coef
         self.mmp_grad_penalty_coef = mmp_grad_penalty_coef
+        self.mmp_reward_coef = mmp_reward_coef
+        self.task_reward_coef = task_reward_coef
         self.discriminator_max_grad_norm = discriminator_max_grad_norm or self.max_grad_norm
         self.min_std = min_std
 
@@ -56,6 +60,7 @@ class MMPPPO(PPO):
         )  # type: ignore
 
         self.mmp_rewards: torch.Tensor | None = None
+        self.style_rewards: torch.Tensor | None = None
         self.mmp_scores: torch.Tensor | None = None
 
     def process_env_step(
@@ -68,7 +73,8 @@ class MMPPPO(PPO):
         """Record one environment step using MMP rewards computed from env-fed expert observations."""
         disc_obs = self.discriminator.get_policy_obs(obs, flatten_history_dim=False)
         disc_expert_obs = self.discriminator.get_expert_obs(obs, flatten_history_dim=False)
-        self.mmp_rewards, self.mmp_scores = self.discriminator.predict_reward(disc_obs, rewards.to(self.device))
+        self.style_rewards, self.mmp_scores = self.discriminator.compute_style_reward(disc_obs)
+        self.mmp_rewards = self.task_reward_coef * rewards.to(self.device) + self.mmp_reward_coef * self.style_rewards
 
         self.disc_obs_buffer.append(disc_obs.detach())
         self.disc_expert_obs_buffer.append(disc_expert_obs.detach())
@@ -239,6 +245,7 @@ class MMPPPO(PPO):
             "mmp_grad_penalty": mean_grad_penalty / num_updates,
             "mmp_policy_pred": mean_policy_pred / num_updates,
             "mmp_expert_pred": mean_expert_pred / num_updates,
+            "mmp_reward_coef": self.mmp_reward_coef,
         }
         if mean_rnd_loss is not None:
             loss_dict["rnd"] = mean_rnd_loss / num_updates

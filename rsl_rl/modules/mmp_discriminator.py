@@ -42,7 +42,6 @@ class MMPDiscriminator(nn.Module):
         activation: str = "relu",
         loss_type: str = "lsgan",
         reward_coef: float = 1.0,
-        task_reward_lerp: float = 0.0,
         device: str = "cpu",
     ) -> None:
         """Initialize the MMP discriminator."""
@@ -57,7 +56,6 @@ class MMPDiscriminator(nn.Module):
         self.expert_obs_groups = list(expert_obs_groups)
         self.loss_type = MMPLossType(loss_type.lower())
         self.reward_coef = reward_coef
-        self.task_reward_lerp = task_reward_lerp
         self.device = device
 
         trunk_hidden_dims = hidden_dims[:-1] if len(hidden_dims) > 1 else hidden_dims
@@ -90,8 +88,8 @@ class MMPDiscriminator(nn.Module):
         self._validate_disc_obs(disc_obs)
         self.obs_normalizer.update(disc_obs.reshape(-1, self.disc_obs_dim))  # type: ignore
 
-    def predict_reward(self, disc_obs: torch.Tensor, task_reward: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert discriminator predictions into MMP style rewards."""
+    def compute_style_reward(self, disc_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert discriminator predictions into pure MMP style rewards."""
         with torch.no_grad():
             was_training = self.training
             self.eval()
@@ -110,9 +108,6 @@ class MMPDiscriminator(nn.Module):
                 raise ValueError(f"Unsupported MMP loss type: {self.loss_type}.")
 
             style_reward = self.reward_coef * style_reward
-            if self.task_reward_lerp > 0.0:
-                task_reward = task_reward.unsqueeze(-1) if task_reward.ndim == 1 else task_reward
-                style_reward = (1.0 - self.task_reward_lerp) * style_reward + self.task_reward_lerp * task_reward
             if was_training:
                 self.train()
             return style_reward.squeeze(-1), score.squeeze(-1)

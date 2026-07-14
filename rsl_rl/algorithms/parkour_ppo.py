@@ -131,7 +131,9 @@ class ParkourPPO(PPO):
         critic_cnn_latent_key: str = "critic_cnn_latent",
         mmp_id_obs_group: str = "mmp_id",
         mmp_loss_coef: float = 1.0,
-        mmp_grad_penalty_coef: float = 10.0,
+        mmp_grad_penalty_coef: float = 20.0,
+        mmp_reward_coef: float = 0.2,
+        task_reward_coef: float = 1.0,
         discriminator_learning_rate: float | None = None,
         discriminator_optimizer: str = "adam",
         discriminator_max_grad_norm: float | None = None,
@@ -162,6 +164,8 @@ class ParkourPPO(PPO):
         self.mmp_id_obs_group = mmp_id_obs_group
         self.mmp_loss_coef = mmp_loss_coef
         self.mmp_grad_penalty_coef = mmp_grad_penalty_coef
+        self.mmp_reward_coef = mmp_reward_coef
+        self.task_reward_coef = task_reward_coef
         self.discriminator_max_grad_norm = discriminator_max_grad_norm or self.max_grad_norm
         self.discriminator_mini_batch_size = discriminator_mini_batch_size
         self.min_std = min_std
@@ -177,6 +181,7 @@ class ParkourPPO(PPO):
         self.disc_obs_dim = first_discriminator.disc_obs_dim
 
         self.mmp_rewards: torch.Tensor | None = None
+        self.style_rewards: torch.Tensor | None = None
         self.mmp_scores: torch.Tensor | None = None
 
         self.cnn = self._raw_actor.cnn
@@ -206,7 +211,9 @@ class ParkourPPO(PPO):
             unknown_ids = torch.unique(mmp_ids[~known_id_mask]).detach().cpu().tolist()
             raise ValueError(f"ParkourPPO received unknown MMP discriminator ids: {unknown_ids}.")
 
-        self.mmp_rewards = torch.zeros_like(rewards, device=self.device)
+        task_rewards = rewards.to(self.device)
+        self.style_rewards = torch.zeros_like(task_rewards, device=self.device)
+        self.mmp_rewards = torch.zeros_like(task_rewards, device=self.device)
         self.mmp_scores = torch.zeros_like(rewards, device=self.device)
 
         for disc_id in self.discriminator_ids:
@@ -217,14 +224,15 @@ class ParkourPPO(PPO):
             discriminator = self.discriminators[str(disc_id)]
             disc_policy_obs = policy_obs[mask]
             disc_expert_obs = expert_obs[mask]
-            disc_rewards, disc_scores = discriminator.predict_reward(disc_policy_obs, rewards[mask].to(self.device))
-            self.mmp_rewards[mask] = disc_rewards
+            disc_style_rewards, disc_scores = discriminator.compute_style_reward(disc_policy_obs)
+            self.style_rewards[mask] = disc_style_rewards
             self.mmp_scores[mask] = disc_scores
             self.disc_buffers[disc_id].insert(
                 disc_policy_obs.reshape(disc_policy_obs.shape[0], -1),
                 disc_expert_obs.reshape(disc_expert_obs.shape[0], -1),
             )
 
+        self.mmp_rewards = self.task_reward_coef * task_rewards + self.mmp_reward_coef * self.style_rewards
         super().process_env_step(obs, self.mmp_rewards, dones, extras)
 
     def update(self) -> dict[str, float]:  # noqa: C901
@@ -365,6 +373,7 @@ class ParkourPPO(PPO):
             "mmp_grad_penalty": mean_grad_penalty / num_updates,
             "mmp_policy_pred": mean_policy_pred / num_updates,
             "mmp_expert_pred": mean_expert_pred / num_updates,
+            "mmp_reward_coef": self.mmp_reward_coef,
         }
         if mean_rnd_loss is not None:
             loss_dict["rnd"] = mean_rnd_loss / num_updates
