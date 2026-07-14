@@ -216,6 +216,22 @@ class ParkourPPO(PPO):
                 "mmp_obs_abs_max_policy": policy_obs.abs().max().item(),
                 "mmp_obs_abs_max_expert": expert_obs.abs().max().item(),
             }
+            if policy_obs.shape[-1] % 15 == 0:
+                num_bodies = policy_obs.shape[-1] // 15
+                slices = {
+                    "pos": slice(0, 3 * num_bodies),
+                    "ori": slice(3 * num_bodies, 9 * num_bodies),
+                    "lin_vel": slice(9 * num_bodies, 12 * num_bodies),
+                    "ang_vel": slice(12 * num_bodies, 15 * num_bodies),
+                }
+                for name, obs_slice in slices.items():
+                    policy_part = policy_obs[..., obs_slice]
+                    expert_part = expert_obs[..., obs_slice]
+                    self._mmp_obs_stats[f"mmp_obs_abs_diff_{name}"] = (
+                        policy_part - expert_part
+                    ).abs().mean().item()
+                    self._mmp_obs_stats[f"mmp_policy_obs_std_{name}"] = policy_part.std().item()
+                    self._mmp_obs_stats[f"mmp_expert_obs_std_{name}"] = expert_part.std().item()
         mmp_ids = _get_mmp_ids(obs, self.mmp_id_obs_group)
         known_id_mask = torch.zeros_like(mmp_ids, dtype=torch.bool)
         for disc_id in self.discriminator_ids:
