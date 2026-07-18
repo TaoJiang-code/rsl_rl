@@ -15,7 +15,7 @@ from rsl_rl.algorithms.amp_ppo import AMPPPO, _construct_amp_data, _resolve_disc
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import CNNModel, MLPModel, MoEMLPModel
-from rsl_rl.modules import Discriminator, Distribution, EmpiricalNormalization, HiddenState
+from rsl_rl.modules import Discriminator, Distribution, EmpiricalNormalization, HiddenState, MLP
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import AMPLoader, resolve_callable, resolve_obs_groups, unpad_trajectories
 
@@ -120,6 +120,41 @@ class _EncoderMoEModel(nn.Module):
         return self.head.get_kl_divergence(old_params, new_params)
 
 
+class _FootholdEstimator(nn.Module):
+    """Predict left/right touchdown foothold xy from privileged observations and actions."""
+
+    is_recurrent: bool = False
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] | list[int] = (256, 128),
+        activation: str = "elu",
+        obs_normalization: bool = False,
+    ) -> None:
+        super().__init__()
+        input_dim = obs_dim + action_dim
+        self.obs_normalization = obs_normalization
+        self.obs_normalizer = EmpiricalNormalization(input_dim) if obs_normalization else nn.Identity()
+        self.mlp = MLP(input_dim, output_dim, hidden_dims, activation)
+
+    def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        estimator_input = torch.cat([obs, actions], dim=-1)
+        return self.mlp(self.obs_normalizer(estimator_input))
+
+    def update_normalization(self, obs: torch.Tensor, actions: torch.Tensor) -> None:
+        if self.obs_normalization:
+            self.obs_normalizer.update(torch.cat([obs, actions], dim=-1))  # type: ignore
+
+    def reset(self, dones: torch.Tensor | None = None) -> None:
+        pass
+
+    def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
+        pass
+
+
 class _ParkourActorModel(_EncoderMoEModel):
     """Parkour actor wrapper with CNN and velocity-estimator latents."""
 
@@ -127,17 +162,23 @@ class _ParkourActorModel(_EncoderMoEModel):
         self,
         cnn: CNNModel,
         velocity_estimator: MLPModel,
+        foothold_estimator: _FootholdEstimator,
         head: MoEMLPModel,
         cnn_latent_key: str,
         velocity_latent_key: str,
         velocity_target_key: str,
+        foothold_obs_groups: list[str],
+        foothold_target_key: str,
     ) -> None:
         if velocity_estimator.is_recurrent:
             raise ValueError("ParkourPPO currently supports feed-forward velocity estimators only.")
         super().__init__(cnn, head, cnn_latent_key)
         self.velocity_estimator = velocity_estimator
+        self.foothold_estimator = foothold_estimator
         self.velocity_latent_key = velocity_latent_key
         self.velocity_target_key = velocity_target_key
+        self.foothold_obs_groups = foothold_obs_groups
+        self.foothold_target_key = foothold_target_key
 
     def _augment_observations(self, obs: TensorDict) -> TensorDict:
         data = {key: value for key, value in super()._augment_observations(obs).items()}
@@ -149,6 +190,21 @@ class _ParkourActorModel(_EncoderMoEModel):
         target_velocity = obs[self.velocity_target_key]
         return nn.functional.mse_loss(predicted_velocity, target_velocity)
 
+    def compute_foothold_loss(self, obs: TensorDict, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        foothold_obs = torch.cat([obs[group] for group in self.foothold_obs_groups], dim=-1)
+        self.foothold_estimator.update_normalization(foothold_obs, actions)
+        predicted_foothold = self.foothold_estimator(foothold_obs, actions)
+        target = obs[self.foothold_target_key]
+
+        left_valid = target[:, 2]
+        right_valid = target[:, 5]
+        left_error = torch.mean(torch.square(predicted_foothold[:, 0:2] - target[:, 0:2]), dim=-1)
+        right_error = torch.mean(torch.square(predicted_foothold[:, 2:4] - target[:, 3:5]), dim=-1)
+        valid_count = left_valid.sum() + right_valid.sum()
+        loss = (left_error * left_valid + right_error * right_valid).sum() / valid_count.clamp_min(1.0)
+        valid_rate = valid_count / (2.0 * target.shape[0])
+        return loss, valid_rate
+
     def update_normalization(self, obs: TensorDict) -> None:
         if self.cnn.obs_groups:
             self.cnn.update_normalization(obs)
@@ -159,11 +215,13 @@ class _ParkourActorModel(_EncoderMoEModel):
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         self.cnn.reset(dones)
         self.velocity_estimator.reset(dones)
+        self.foothold_estimator.reset(dones)
         self.head.reset(dones, hidden_state)
 
     def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
         self.cnn.detach_hidden_state(dones)
         self.velocity_estimator.detach_hidden_state(dones)
+        self.foothold_estimator.detach_hidden_state(dones)
         self.head.detach_hidden_state(dones)
 
 
@@ -179,12 +237,16 @@ class ParkourPPO(AMPPPO):
         discriminator: Discriminator,
         amp_data: AMPLoader,
         velocity_estimator: MLPModel,
+        foothold_estimator: _FootholdEstimator,
+        foothold_obs_groups: list[str],
         critic_cnn: CNNModel | None = None,
         actor_cnn_latent_key: str = "actor_cnn_latent",
         critic_cnn_latent_key: str = "critic_cnn_latent",
         actor_velocity_latent_key: str = "actor_velocity_latent",
         velocity_target_key: str = "velocity_estimator",
+        foothold_target_key: str = "foothold_estimator",
         velocity_loss_coef: float = 1.0,
+        foothold_loss_coef: float = 1.0,
         **amp_ppo_kwargs: Any,
     ) -> None:
         """Initialize CNN encoders, MoE heads, and the existing AMP implementation."""
@@ -194,10 +256,13 @@ class ParkourPPO(AMPPPO):
         actor_model = _ParkourActorModel(
             cnn,
             velocity_estimator,
+            foothold_estimator,
             actor,
             actor_cnn_latent_key,
             actor_velocity_latent_key,
             velocity_target_key,
+            foothold_obs_groups,
+            foothold_target_key,
         )
         critic_model = _EncoderMoEModel(critic_cnn, critic, critic_cnn_latent_key)
         super().__init__(
@@ -214,7 +279,9 @@ class ParkourPPO(AMPPPO):
         self.actor_head = self._raw_actor.head
         self.critic_head = self._raw_critic.head
         self.velocity_estimator = self._raw_actor.velocity_estimator
+        self.foothold_estimator = self._raw_actor.foothold_estimator
         self.velocity_loss_coef = velocity_loss_coef
+        self.foothold_loss_coef = foothold_loss_coef
 
     def act(self, obs: TensorDict, amp_obs: torch.Tensor | None = None) -> torch.Tensor:
         """Sample actions through CNN and MoE while recording the AMP state."""
@@ -250,6 +317,8 @@ class ParkourPPO(AMPPPO):
         mean_policy_pred = 0.0
         mean_expert_pred = 0.0
         mean_velocity_loss = 0.0
+        mean_foothold_loss = 0.0
+        mean_foothold_valid_rate = 0.0
         mean_rnd_loss = 0.0 if self.rnd else None
         mean_symmetry_loss = 0.0 if self.symmetry else None
 
@@ -277,6 +346,10 @@ class ParkourPPO(AMPPPO):
                     batch.advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             velocity_loss = self._raw_actor.compute_velocity_loss(batch.observations[:original_batch_size])
+            foothold_loss, foothold_valid_rate = self._raw_actor.compute_foothold_loss(
+                batch.observations[:original_batch_size],
+                batch.actions[:original_batch_size],  # type: ignore
+            )
 
             if self.symmetry:
                 self.symmetry.augment_batch(batch, original_batch_size)
@@ -336,6 +409,7 @@ class ParkourPPO(AMPPPO):
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy.mean()
                 + self.velocity_loss_coef * velocity_loss
+                + self.foothold_loss_coef * foothold_loss
             )
 
             rnd_loss = (
@@ -396,6 +470,8 @@ class ParkourPPO(AMPPPO):
             mean_policy_pred += policy_logits.mean().item()
             mean_expert_pred += expert_logits.mean().item()
             mean_velocity_loss += velocity_loss.item()
+            mean_foothold_loss += foothold_loss.item()
+            mean_foothold_valid_rate += foothold_valid_rate.item()
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
             if mean_symmetry_loss is not None:
@@ -411,6 +487,8 @@ class ParkourPPO(AMPPPO):
             "amp_policy_pred": mean_policy_pred / num_updates,
             "amp_expert_pred": mean_expert_pred / num_updates,
             "velocity_estimator": mean_velocity_loss / num_updates,
+            "foothold_estimator": mean_foothold_loss / num_updates,
+            "foothold_valid_rate": mean_foothold_valid_rate / num_updates,
         }
         if mean_rnd_loss is not None:
             loss_dict["rnd"] = mean_rnd_loss / num_updates
@@ -432,6 +510,7 @@ class ParkourPPO(AMPPPO):
         critic_class: type[MoEMLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
         velocity_estimator_cfg = cfg["velocity_estimator"]
         velocity_estimator_class: type[MLPModel] = resolve_callable(velocity_estimator_cfg.pop("class_name"))  # type: ignore
+        foothold_estimator_cfg = cfg["foothold_estimator"]
         if not issubclass(actor_class, MoEMLPModel):
             raise TypeError(f"ParkourPPO actor must be a MoEMLPModel, got {actor_class.__name__}.")
         if not issubclass(critic_class, MoEMLPModel):
@@ -481,6 +560,17 @@ class ParkourPPO(AMPPPO):
             **velocity_estimator_cfg,
         ).to(device)
         print(f"Velocity Estimator Model: {velocity_estimator}")
+
+        foothold_input_set = foothold_estimator_cfg.pop("obs_set", "critic")
+        foothold_obs_groups = cfg["obs_groups"][foothold_input_set]
+        foothold_obs_dim = sum(obs[group].shape[-1] for group in foothold_obs_groups)
+        foothold_estimator = _FootholdEstimator(
+            foothold_obs_dim,
+            env.num_actions,
+            foothold_estimator_cfg.pop("output_dim"),
+            **foothold_estimator_cfg,
+        ).to(device)
+        print(f"Foothold Estimator Model: {foothold_estimator}")
 
         with torch.no_grad():
             actor_sample_obs = _add_latent(obs, "actor_cnn_latent", cnn(obs))
@@ -547,6 +637,8 @@ class ParkourPPO(AMPPPO):
             discriminator,
             amp_data,
             velocity_estimator=velocity_estimator,
+            foothold_estimator=foothold_estimator,
+            foothold_obs_groups=foothold_obs_groups,
             critic_cnn=critic_cnn,
             amp_normalizer=amp_normalizer,
             min_std=min_std,
