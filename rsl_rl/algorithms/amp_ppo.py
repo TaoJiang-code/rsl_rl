@@ -539,3 +539,4 @@ def _resolve_discriminator_cfg(cfg: dict, amp_obs_dim: int) -> dict:
     discr_cfg.setdefault("hidden_dims", cfg.get("amp_discr_hidden_dims", [1024, 512]))
     discr_cfg.setdefault("task_reward_lerp", cfg.get("amp_task_reward_lerp", 0.0))
     return discr_cfg
+
