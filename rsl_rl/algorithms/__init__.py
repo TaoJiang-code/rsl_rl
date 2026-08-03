@@ -10,5 +10,6 @@ from .distillation import Distillation
 from .dwaq_ppo import DWAQPPO
 from .parkour_ppo import ParkourPPO
 from .ppo import PPO
+from .rgmt import RGMT, RGMTActorModel
 
-__all__ = ["AMPPPO", "DWAQPPO", "ParkourPPO", "PPO", "Distillation"]
+__all__ = ["AMPPPO", "DWAQPPO", "ParkourPPO", "PPO", "RGMT", "RGMTActorModel", "Distillation"]

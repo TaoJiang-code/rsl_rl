@@ -10,6 +10,14 @@ from .distillation_runner import DistillationRunner
 from .dwaq_runner import DWAQRunner
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
 from .parkour_on_policy_runner import ParkourOnPolicyRunner
+from .rgmt_runner import RGMTRunner
 
 
-__all__ = ["AmpOnPolicyRunner", "DistillationRunner", "DWAQRunner", "OnPolicyRunner", "ParkourOnPolicyRunner"]
+__all__ = [
+    "AmpOnPolicyRunner",
+    "DistillationRunner",
+    "DWAQRunner",
+    "OnPolicyRunner",
+    "ParkourOnPolicyRunner",
+    "RGMTRunner",
+]
