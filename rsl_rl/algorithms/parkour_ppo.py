@@ -119,6 +119,57 @@ class _EncoderMoEModel(nn.Module):
         """Compute distribution KL divergence."""
         return self.head.get_kl_divergence(old_params, new_params)
 
+    def as_jit(self) -> nn.Module:
+        """Return a TorchScript-friendly encoder+MoE policy."""
+        return _TorchEncoderMoEModel(self)
+
+
+class _TorchMoEHead(nn.Module):
+    """Exportable deterministic MoE head."""
+
+    def __init__(self, head: MoEMLPModel) -> None:
+        super().__init__()
+        self.obs_normalizer = copy.deepcopy(head.obs_normalizer)
+        self.experts = nn.ModuleList([copy.deepcopy(expert) for expert in head.mlp.experts])
+        self.gate = copy.deepcopy(head.mlp.gate)
+        if head.distribution is not None:
+            self.deterministic_output = head.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        latent = self.obs_normalizer(obs)
+        gate_weights = torch.softmax(self.gate(latent), dim=-1)
+        output = self.experts[0](latent) * gate_weights[:, 0].unsqueeze(-1)
+        for index, expert in enumerate(self.experts):
+            if index == 0:
+                continue
+            output = output + expert(latent) * gate_weights[:, index].unsqueeze(-1)
+        return self.deterministic_output(output)
+
+
+class _TorchEncoderMoEModel(nn.Module):
+    """Exportable CNN encoder + MoE head policy.
+
+    Forward inputs:
+        actor_obs: concatenated non-image actor observations.
+        cnn_obs_1d: concatenated 1D CNN observations, or an empty ``[B, 0]`` tensor.
+        cnn_obs_2d: image tensors in the same order as the CNN config.
+    """
+
+    def __init__(self, model: _EncoderMoEModel) -> None:
+        super().__init__()
+        self.cnn = model.cnn.as_jit()
+        self.head = _TorchMoEHead(model.head)
+
+    def forward(self, actor_obs: torch.Tensor, cnn_obs_1d: torch.Tensor, cnn_obs_2d: list[torch.Tensor]) -> torch.Tensor:
+        cnn_latent = self.cnn(cnn_obs_1d, cnn_obs_2d)
+        return self.head(torch.cat((actor_obs, cnn_latent), dim=-1))
+
+    @torch.jit.export
+    def reset(self) -> None:
+        pass
+
 
 class _FootholdEstimator(nn.Module):
     """Predict left/right touchdown foothold xy from privileged observations and actions."""
@@ -223,6 +274,47 @@ class _ParkourActorModel(_EncoderMoEModel):
         self.velocity_estimator.detach_hidden_state(dones)
         self.foothold_estimator.detach_hidden_state(dones)
         self.head.detach_hidden_state(dones)
+
+    def as_jit(self) -> nn.Module:
+        """Return a TorchScript-friendly parkour actor."""
+        return _TorchParkourActorModel(self)
+
+
+class _TorchParkourActorModel(nn.Module):
+    """Exportable parkour actor.
+
+    Forward inputs:
+        actor_obs: concatenated base actor observations, before CNN/velocity latents.
+        cnn_obs_1d: concatenated 1D CNN observations, or an empty ``[B, 0]`` tensor.
+        cnn_obs_2d: image tensors in the same order as the CNN config.
+        velocity_obs: concatenated velocity-estimator observations.
+    """
+
+    def __init__(self, model: _ParkourActorModel) -> None:
+        super().__init__()
+        self.cnn = model.cnn.as_jit()
+        self.velocity_obs_normalizer = copy.deepcopy(model.velocity_estimator.obs_normalizer)
+        self.velocity_mlp = copy.deepcopy(model.velocity_estimator.mlp)
+        if model.velocity_estimator.distribution is not None:
+            self.velocity_output = model.velocity_estimator.distribution.as_deterministic_output_module()
+        else:
+            self.velocity_output = nn.Identity()
+        self.head = _TorchMoEHead(model.head)
+
+    def forward(
+        self,
+        actor_obs: torch.Tensor,
+        cnn_obs_1d: torch.Tensor,
+        cnn_obs_2d: list[torch.Tensor],
+        velocity_obs: torch.Tensor,
+    ) -> torch.Tensor:
+        cnn_latent = self.cnn(cnn_obs_1d, cnn_obs_2d)
+        velocity_latent = self.velocity_output(self.velocity_mlp(self.velocity_obs_normalizer(velocity_obs)))
+        return self.head(torch.cat((actor_obs, cnn_latent, velocity_latent), dim=-1))
+
+    @torch.jit.export
+    def reset(self) -> None:
+        pass
 
 
 class ParkourPPO(AMPPPO):

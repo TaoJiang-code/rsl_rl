@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import torch
 import torch.nn as nn
@@ -252,6 +253,10 @@ class RGMTActorModel(nn.Module):
     def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
         pass
 
+    def as_jit(self) -> nn.Module:
+        """Return a TorchScript-friendly deterministic RGMT actor."""
+        return _TorchRGMTActorModel(self)
+
     @property
     def output_mean(self) -> torch.Tensor:
         return self.distribution.mean  # type: ignore
@@ -315,6 +320,59 @@ class RGMTActorModel(nn.Module):
             else:
                 sequences.append(value.reshape(batch_size, sequence_length, -1))
         return torch.cat(sequences, dim=-1)
+
+
+class _TorchRGMTActorModel(nn.Module):
+    """Exportable RGMT actor.
+
+    Forward inputs:
+        policy_obs: concatenated current actor observations.
+        history_obs: ``[B, history_length, history_step_dim]``.
+        command_obs: ``[B, command_window_size, command_step_dim]``.
+    """
+
+    def __init__(self, model: RGMTActorModel) -> None:
+        super().__init__()
+        self.history_length = model.history_length
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.history_normalizer = copy.deepcopy(model.history_normalizer)
+        self.command_normalizer = copy.deepcopy(model.command_normalizer)
+        self.history_step_encoder = copy.deepcopy(model.history_step_encoder)
+        self.history_position_encoding = copy.deepcopy(model.history_position_encoding)
+        self.history_blocks = copy.deepcopy(model.history_blocks)
+        self.dynamics_query_encoder = copy.deepcopy(model.dynamics_query_encoder)
+        self.command_step_encoder = copy.deepcopy(model.command_step_encoder)
+        self.command_position_encoding = copy.deepcopy(model.command_position_encoding)
+        self.command_block = copy.deepcopy(model.command_block)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+
+    def forward(self, policy_obs: torch.Tensor, history_obs: torch.Tensor, command_obs: torch.Tensor) -> torch.Tensor:
+        policy_obs = self.obs_normalizer(policy_obs)
+        history = self.history_normalizer(history_obs)
+        command = self.command_normalizer(command_obs)
+
+        history_tokens = self.history_position_encoding(self.history_step_encoder(history))
+        causal_mask = torch.triu(
+            torch.ones(self.history_length, self.history_length, device=history_tokens.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        for block in self.history_blocks:
+            history_tokens = block(history_tokens, causal_mask)
+        dynamics_latent = torch.max(history_tokens, dim=1).values
+
+        command_query = self.dynamics_query_encoder(dynamics_latent)
+        command_tokens = self.command_position_encoding(self.command_step_encoder(command))
+        command_latent = self.command_block(command_query, command_tokens)
+        out = self.mlp(torch.cat((policy_obs, dynamics_latent, command_latent), dim=-1))
+        return self.deterministic_output(out)
+
+    @torch.jit.export
+    def reset(self) -> None:
+        pass
 
 
 class RGMT(PPO):

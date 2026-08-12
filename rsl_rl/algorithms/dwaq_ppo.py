@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -124,6 +125,41 @@ class _DWAQActorModel(nn.Module):
     ) -> torch.Tensor:
         """Compute action-distribution KL divergence."""
         return self.actor.get_kl_divergence(old_params, new_params)
+
+    def as_jit(self) -> nn.Module:
+        """Return a TorchScript-friendly deterministic DWAQ policy."""
+        return _TorchDWAQActorModel(self)
+
+
+class _TorchDWAQActorModel(nn.Module):
+    """Exportable DWAQ actor.
+
+    Forward inputs:
+        actor_obs: concatenated actor observations before the context latent.
+        context_obs: concatenated observations consumed by the ContextVAE.
+    """
+
+    def __init__(self, model: _DWAQActorModel) -> None:
+        super().__init__()
+        self.context_obs_normalizer = copy.deepcopy(model._context_vae.obs_normalizer)
+        self.context_vae = copy.deepcopy(model._context_vae.vae)
+        self.actor_obs_normalizer = copy.deepcopy(model.actor.obs_normalizer)
+        self.actor_mlp = copy.deepcopy(model.actor.mlp)
+        if model.actor.distribution is not None:
+            self.deterministic_output = model.actor.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+
+    def forward(self, actor_obs: torch.Tensor, context_obs: torch.Tensor) -> torch.Tensor:
+        context_latent = self.context_obs_normalizer(context_obs)
+        context_code = self.context_vae.encode(context_latent, deterministic=True)
+        latent = torch.cat((actor_obs, context_code), dim=-1)
+        out = self.actor_mlp(self.actor_obs_normalizer(latent))
+        return self.deterministic_output(out)
+
+    @torch.jit.export
+    def reset(self) -> None:
+        pass
 
 
 class DWAQPPO(PPO):
