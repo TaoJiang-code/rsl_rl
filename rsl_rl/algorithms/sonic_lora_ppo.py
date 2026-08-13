@@ -323,7 +323,9 @@ class SonicG1ActorModule(nn.Module):
             (tokenizer_obs["command_multi_future_nonflat"], tokenizer_obs["motion_anchor_ori_b_mf_nonflat"]), dim=-1
         )
         tokens = self.encoders["g1"](encoder_input)
-        tokens, _ = self.quantizer(tokens)
+        token_shape = tokens.shape
+        tokens, _ = self.quantizer(tokens.reshape(-1, self.max_num_tokens, self.token_dim))
+        tokens = tokens.reshape(token_shape)
         token_flat = tokens.reshape(batch_size, seq_len, self.token_total_dim)
         return self.decoders["g1_dyn"](torch.cat((token_flat, input_data["actor_obs"]), dim=-1))
 
