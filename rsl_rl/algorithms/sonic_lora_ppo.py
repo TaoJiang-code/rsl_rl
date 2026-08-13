@@ -702,7 +702,29 @@ class SonicLoRAPPO(PPO):
             dummy_cls = getattr(module, class_name)
             if isinstance(dummy_cls, type):
                 return dummy_cls
-        dummy_cls = type(class_name, (), {"__module__": module_name})
+        def __new__(cls, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            return object.__new__(cls)
+
+        def __init__(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            self.args = args
+            self.kwargs = kwargs
+
+        def __setstate__(self, state):  # noqa: ANN001
+            if isinstance(state, dict):
+                self.__dict__.update(state)
+            else:
+                self.state = state
+
+        dummy_cls = type(
+            class_name,
+            (),
+            {
+                "__module__": module_name,
+                "__new__": __new__,
+                "__init__": __init__,
+                "__setstate__": __setstate__,
+            },
+        )
         setattr(module, class_name, dummy_cls)
         return dummy_cls
 
