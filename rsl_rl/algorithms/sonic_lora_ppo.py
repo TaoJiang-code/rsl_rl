@@ -565,6 +565,8 @@ class SonicLoRAPPO(PPO):
         if freeze_critic_base:
             freeze_non_lora_parameters(self._raw_critic, train_distribution=False)
 
+        self._raw_actor.to(self.device)
+        self._raw_critic.to(self.device)
         self.optimizer = self._build_optimizer()
 
     def save(self) -> dict:
