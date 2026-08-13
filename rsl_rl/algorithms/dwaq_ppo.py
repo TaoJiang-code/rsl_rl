@@ -142,7 +142,9 @@ class _TorchDWAQActorModel(nn.Module):
     def __init__(self, model: _DWAQActorModel) -> None:
         super().__init__()
         self.context_obs_normalizer = copy.deepcopy(model._context_vae.obs_normalizer)
-        self.context_vae = copy.deepcopy(model._context_vae.vae)
+        self.context_encoder = copy.deepcopy(model._context_vae.vae.encoder)
+        self.context_mean_vel = copy.deepcopy(model._context_vae.vae.mean_vel)
+        self.context_mean_latent = copy.deepcopy(model._context_vae.vae.mean_latent)
         self.actor_obs_normalizer = copy.deepcopy(model.actor.obs_normalizer)
         self.actor_mlp = copy.deepcopy(model.actor.mlp)
         if model.actor.distribution is not None:
@@ -152,7 +154,11 @@ class _TorchDWAQActorModel(nn.Module):
 
     def forward(self, actor_obs: torch.Tensor, context_obs: torch.Tensor) -> torch.Tensor:
         context_latent = self.context_obs_normalizer(context_obs)
-        context_code = self.context_vae.encode(context_latent, deterministic=True)
+        context_hidden = self.context_encoder(context_latent)
+        context_code = torch.cat(
+            (self.context_mean_vel(context_hidden), self.context_mean_latent(context_hidden)),
+            dim=-1,
+        )
         latent = torch.cat((actor_obs, context_code), dim=-1)
         out = self.actor_mlp(self.actor_obs_normalizer(latent))
         return self.deterministic_output(out)
