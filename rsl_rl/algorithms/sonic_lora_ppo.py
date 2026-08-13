@@ -603,7 +603,7 @@ class SonicLoRAPPO(PPO):
         path = Path(self.source_checkpoint_path)
         if not path.is_file():
             raise FileNotFoundError(f"Sonic source checkpoint does not exist: {path}")
-        checkpoint = torch.load(path, weights_only=False, map_location=self.device)
+        checkpoint = torch.load(path, weights_only=True, map_location=self.device)
         if self.load_actor_from_source:
             actor_state = self._extract_state_dict(
                 checkpoint,
