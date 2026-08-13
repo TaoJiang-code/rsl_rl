@@ -11,6 +11,7 @@ from .dwaq_runner import DWAQRunner
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
 from .parkour_on_policy_runner import ParkourOnPolicyRunner
 from .rgmt_runner import RGMTRunner
+from .sonic_lora_runner import SonicLoRARunner
 
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "OnPolicyRunner",
     "ParkourOnPolicyRunner",
     "RGMTRunner",
+    "SonicLoRARunner",
 ]
