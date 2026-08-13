@@ -23,6 +23,10 @@ from __future__ import annotations
 from itertools import chain
 from pathlib import Path
 from typing import Any
+import pickle
+import re
+import sys
+import types
 
 import torch
 import torch.nn as nn
@@ -603,7 +607,7 @@ class SonicLoRAPPO(PPO):
         path = Path(self.source_checkpoint_path)
         if not path.is_file():
             raise FileNotFoundError(f"Sonic source checkpoint does not exist: {path}")
-        checkpoint = torch.load(path, weights_only=True, map_location=self.device)
+        checkpoint = self._load_checkpoint_weights_only(path)
         if self.load_actor_from_source:
             actor_state = self._extract_state_dict(
                 checkpoint,
@@ -635,6 +639,61 @@ class SonicLoRAPPO(PPO):
         if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
             return checkpoint
         raise KeyError(f"Could not find any state_dict key in checkpoint. Tried: {keys}.")
+
+    def _load_checkpoint_weights_only(self, path: Path) -> dict:
+        """Load a Sonic checkpoint without requiring training-framework Python packages.
+
+        Some public Sonic checkpoints include trainer-state objects from packages
+        such as ``trl`` next to the model tensors.  PyTorch's weights-only loader
+        refuses those globals by default even though they are irrelevant for
+        fine-tuning.  We allowlist lightweight dummy classes for unsupported
+        globals and retry, while still using ``weights_only=True``.
+        """
+
+        allowed_globals: set[str] = set()
+        for _ in range(32):
+            try:
+                return torch.load(path, weights_only=True, map_location=self.device)
+            except pickle.UnpicklingError as exc:
+                unsupported_global = self._parse_unsupported_global(str(exc))
+                if unsupported_global is None or unsupported_global in allowed_globals:
+                    raise
+                torch.serialization.add_safe_globals([self._make_dummy_global(unsupported_global)])
+                allowed_globals.add(unsupported_global)
+        raise RuntimeError(f"Too many unsupported globals while loading Sonic checkpoint: {path}")
+
+    @staticmethod
+    def _parse_unsupported_global(message: str) -> str | None:
+        match = re.search(r"Unsupported global: GLOBAL ([\w.]+)", message)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _make_dummy_global(global_name: str) -> type:
+        module_name, class_name = global_name.rsplit(".", 1)
+        module = SonicLoRAPPO._ensure_dummy_module(module_name)
+        if hasattr(module, class_name):
+            dummy_cls = getattr(module, class_name)
+            if isinstance(dummy_cls, type):
+                return dummy_cls
+        dummy_cls = type(class_name, (), {"__module__": module_name})
+        setattr(module, class_name, dummy_cls)
+        return dummy_cls
+
+    @staticmethod
+    def _ensure_dummy_module(module_name: str) -> types.ModuleType:
+        parts = module_name.split(".")
+        parent_module = None
+        current_name = ""
+        for part in parts:
+            current_name = part if not current_name else f"{current_name}.{part}"
+            module = sys.modules.get(current_name)
+            if module is None:
+                module = types.ModuleType(current_name)
+                sys.modules[current_name] = module
+                if parent_module is not None:
+                    setattr(parent_module, part, module)
+            parent_module = module
+        return sys.modules[module_name]
 
     def _load_source_state_dict(self, module: nn.Module, source_state: dict, module_name: str) -> None:
         if self.source_load_strict:
