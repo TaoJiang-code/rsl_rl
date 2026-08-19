@@ -6,7 +6,7 @@
 """Learning algorithms."""
 
 from .amp_ppo import AMPPPO
-from .bfm_dagger_ppo import BFMActorModel, BFMDAggerPPO, KitovBackwardEncoderWrapper
+from .bfm_dagger_ppo import BFMActorModel, BFMDAggerPPO, KitovBackwardEncoderWrapper, KitovTeacherActorWrapper
 from .distillation import Distillation
 from .dwaq_ppo import DWAQPPO
 from .parkour_ppo import ParkourPPO
@@ -20,6 +20,7 @@ __all__ = [
     "DWAQPPO",
     "BFMActorModel",
     "KitovBackwardEncoderWrapper",
+    "KitovTeacherActorWrapper",
     "ParkourPPO",
     "PPO",
     "RGMT",

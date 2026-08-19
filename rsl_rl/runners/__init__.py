@@ -6,6 +6,7 @@
 """Runners for environment-agent interaction."""
 
 from .amp_on_policy_runner import AmpOnPolicyRunner
+from .bfm_dagger_runner import BFMDaggerRunner
 from .distillation_runner import DistillationRunner
 from .dwaq_runner import DWAQRunner
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
@@ -16,6 +17,7 @@ from .sonic_lora_runner import SonicLoRARunner
 
 __all__ = [
     "AmpOnPolicyRunner",
+    "BFMDaggerRunner",
     "DistillationRunner",
     "DWAQRunner",
     "OnPolicyRunner",
