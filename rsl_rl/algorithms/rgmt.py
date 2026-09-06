@@ -390,6 +390,9 @@ class RGMT(PPO):
         failure_predictor_horizon_steps: int = 12,
         failure_predictor_num_epochs: int = 1,
         failure_predictor_num_mini_batches: int = 4,
+        failure_replay_buffer_size: int = 0,
+        failure_replay_sample_ratio: float = 0.5,
+        failure_target_weight: float = 1.0,
         failure_reward_weight: float = 0.0,
         failure_reward_threshold: float = 0.3,
         device: str = "cpu",
@@ -400,6 +403,9 @@ class RGMT(PPO):
         self.failure_predictor_horizon_steps = failure_predictor_horizon_steps
         self.failure_predictor_num_epochs = failure_predictor_num_epochs
         self.failure_predictor_num_mini_batches = failure_predictor_num_mini_batches
+        self.failure_replay_buffer_size = failure_replay_buffer_size
+        self.failure_replay_sample_ratio = failure_replay_sample_ratio
+        self.failure_target_weight = failure_target_weight
         self.failure_reward_weight = failure_reward_weight
         self.failure_reward_threshold = failure_reward_threshold
         self.failure_dones = torch.zeros(
@@ -421,7 +427,10 @@ class RGMT(PPO):
             self.failure_predictor.parameters(),
             lr=failure_predictor_learning_rate,
         )
-        self.failure_predictor_loss = nn.BCEWithLogitsLoss()
+        self.failure_replay_inputs = torch.zeros(failure_replay_buffer_size, input_dim, device=self.device)
+        self.failure_replay_targets = torch.zeros(failure_replay_buffer_size, 1, device=self.device)
+        self.failure_replay_pos = 0
+        self.failure_replay_size = 0
         self.failure_reward_sum = 0.0
         self.failure_reward_count = 0
 
@@ -476,6 +485,12 @@ class RGMT(PPO):
     def _update_failure_predictor(self) -> tuple[float, float, float]:
         inputs = self._failure_predictor_inputs()
         targets = self._failure_predictor_targets()
+        current_inputs = inputs
+        current_targets = targets
+        replay_inputs, replay_targets = self._sample_failure_replay(inputs.shape[0])
+        if replay_inputs is not None:
+            inputs = torch.cat((inputs, replay_inputs), dim=0)
+            targets = torch.cat((targets, replay_targets), dim=0)
         batch_size = inputs.shape[0]
         num_mini_batches = min(self.failure_predictor_num_mini_batches, batch_size)
         mini_batch_size = batch_size // num_mini_batches
@@ -489,7 +504,7 @@ class RGMT(PPO):
                 stop = (mini_batch_idx + 1) * mini_batch_size
                 batch_idx = indices[start:stop]
                 logits = self.failure_predictor(inputs[batch_idx])
-                loss = self.failure_predictor_loss(logits, targets[batch_idx])
+                loss = self._failure_predictor_loss(logits, targets[batch_idx])
 
                 self.failure_predictor_optimizer.zero_grad()
                 loss.backward()
@@ -502,8 +517,9 @@ class RGMT(PPO):
                 num_updates += 1
 
         with torch.inference_mode():
-            pred = torch.sigmoid(self.failure_predictor(inputs)).mean().item()
-        return mean_loss / max(num_updates, 1), targets.mean().item(), pred
+            pred = torch.sigmoid(self.failure_predictor(current_inputs)).mean().item()
+        self._insert_failure_replay(current_inputs, current_targets)
+        return mean_loss / max(num_updates, 1), current_targets.mean().item(), pred
 
     def _failure_predictor_inputs(self) -> torch.Tensor:
         observations = [
@@ -517,6 +533,43 @@ class RGMT(PPO):
         obs = torch.cat(observations, dim=-1)
         inputs = torch.cat((obs, self.storage.actions), dim=-1)
         return inputs.flatten(0, 1).detach()
+
+    def _failure_predictor_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        loss = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        weights = 1.0 + (self.failure_target_weight - 1.0) * targets
+        return (loss * weights).sum() / weights.sum().clamp_min(1.0)
+
+    def _insert_failure_replay(self, inputs: torch.Tensor, targets: torch.Tensor) -> None:
+        if self.failure_replay_buffer_size <= 0:
+            return
+        num_samples = min(inputs.shape[0], self.failure_replay_buffer_size)
+        inputs = inputs[-num_samples:]
+        targets = targets[-num_samples:]
+        end = self.failure_replay_pos + num_samples
+        if end <= self.failure_replay_buffer_size:
+            self.failure_replay_inputs[self.failure_replay_pos : end].copy_(inputs)
+            self.failure_replay_targets[self.failure_replay_pos : end].copy_(targets)
+        else:
+            first_count = self.failure_replay_buffer_size - self.failure_replay_pos
+            second_count = num_samples - first_count
+            self.failure_replay_inputs[self.failure_replay_pos :].copy_(inputs[:first_count])
+            self.failure_replay_targets[self.failure_replay_pos :].copy_(targets[:first_count])
+            self.failure_replay_inputs[:second_count].copy_(inputs[first_count:])
+            self.failure_replay_targets[:second_count].copy_(targets[first_count:])
+        self.failure_replay_pos = end % self.failure_replay_buffer_size
+        self.failure_replay_size = min(self.failure_replay_size + num_samples, self.failure_replay_buffer_size)
+
+    def _sample_failure_replay(self, current_batch_size: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.failure_replay_size <= 0 or self.failure_replay_sample_ratio <= 0.0:
+            return None, None
+        num_samples = int(current_batch_size * self.failure_replay_sample_ratio)
+        if num_samples <= 0:
+            return None, None
+        targets = self.failure_replay_targets[: self.failure_replay_size]
+        probabilities = (targets.squeeze(-1) + 0.01).clamp_min(0.0)
+        probabilities = probabilities / probabilities.sum().clamp_min(1.0e-6)
+        indices = torch.multinomial(probabilities, num_samples, replacement=True)
+        return self.failure_replay_inputs[indices].detach(), targets[indices].detach()
 
     def _compute_failure_reward(self, obs: TensorDict, actions: torch.Tensor) -> torch.Tensor:
         predictor_input = self._make_failure_predictor_input(obs, actions)
