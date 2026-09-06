@@ -376,7 +376,190 @@ class _TorchRGMTActorModel(nn.Module):
 
 
 class RGMT(PPO):
-    """PPO with RGMT actor construction."""
+    """PPO with RGMT actor construction and an on-policy failure-risk predictor."""
+
+    def __init__(
+        self,
+        actor: RGMTActorModel,
+        critic: MLPModel,
+        storage: RolloutStorage,
+        failure_predictor_obs_groups: list[str] | tuple[str, ...],
+        failure_predictor_hidden_dims: tuple[int, ...] | list[int] = (256, 256),
+        failure_predictor_activation: str = "elu",
+        failure_predictor_learning_rate: float = 1.0e-3,
+        failure_predictor_horizon_steps: int = 12,
+        failure_predictor_num_epochs: int = 1,
+        failure_predictor_num_mini_batches: int = 4,
+        failure_reward_weight: float = 0.0,
+        failure_reward_threshold: float = 0.3,
+        device: str = "cpu",
+        **ppo_kwargs,
+    ) -> None:
+        super().__init__(actor, critic, storage, device=device, **ppo_kwargs)
+        self.failure_predictor_obs_groups = list(failure_predictor_obs_groups)
+        self.failure_predictor_horizon_steps = failure_predictor_horizon_steps
+        self.failure_predictor_num_epochs = failure_predictor_num_epochs
+        self.failure_predictor_num_mini_batches = failure_predictor_num_mini_batches
+        self.failure_reward_weight = failure_reward_weight
+        self.failure_reward_threshold = failure_reward_threshold
+        self.failure_dones = torch.zeros(
+            self.storage.num_transitions_per_env,
+            self.storage.num_envs,
+            1,
+            device=self.device,
+        )
+
+        obs_dim = sum(math.prod(self.storage.observations[group].shape[2:]) for group in self.failure_predictor_obs_groups)
+        input_dim = obs_dim + math.prod(self.storage.actions.shape[2:])
+        self.failure_predictor = MLP(
+            input_dim,
+            1,
+            failure_predictor_hidden_dims,
+            failure_predictor_activation,
+        ).to(self.device)
+        self.failure_predictor_optimizer = torch.optim.Adam(
+            self.failure_predictor.parameters(),
+            lr=failure_predictor_learning_rate,
+        )
+        self.failure_predictor_loss = nn.BCEWithLogitsLoss()
+        self.failure_reward_sum = 0.0
+        self.failure_reward_count = 0
+
+    def process_env_step(
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+    ) -> None:
+        failure_dones = dones.float().view(-1, 1)
+        if "time_outs" in extras:
+            failure_dones = failure_dones * (1.0 - extras["time_outs"].to(self.device).float().view(-1, 1))
+        self.failure_dones[self.storage.step].copy_(failure_dones)
+
+        if self.failure_reward_weight != 0.0:
+            failure_reward = self._compute_failure_reward(self.transition.observations, self.transition.actions)
+            rewards = rewards + (failure_reward.squeeze(-1) if rewards.ndim == 1 else failure_reward)
+            self.failure_reward_sum += failure_reward.mean().item()
+            self.failure_reward_count += 1
+        super().process_env_step(obs, rewards, dones, extras)
+
+    def update(self) -> dict[str, float]:
+        failure_loss, failure_target, failure_pred = self._update_failure_predictor()
+        loss_dict = super().update()
+        loss_dict["failure_predictor"] = failure_loss
+        loss_dict["failure_target"] = failure_target
+        loss_dict["failure_pred"] = failure_pred
+        loss_dict["failure_reward"] = self.failure_reward_sum / max(self.failure_reward_count, 1)
+        self.failure_reward_sum = 0.0
+        self.failure_reward_count = 0
+        return loss_dict
+
+    def train_mode(self) -> None:
+        super().train_mode()
+        self.failure_predictor.train()
+
+    def eval_mode(self) -> None:
+        super().eval_mode()
+        self.failure_predictor.eval()
+
+    def save(self) -> dict:
+        saved_dict = super().save()
+        saved_dict["failure_predictor_state_dict"] = self.failure_predictor.state_dict()
+        saved_dict["failure_predictor_optimizer_state_dict"] = self.failure_predictor_optimizer.state_dict()
+        return saved_dict
+
+    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
+        load_iteration = super().load(loaded_dict, load_cfg, strict)
+        if "failure_predictor_state_dict" in loaded_dict:
+            self.failure_predictor.load_state_dict(loaded_dict["failure_predictor_state_dict"], strict=strict)
+        if "failure_predictor_optimizer_state_dict" in loaded_dict and (load_cfg is None or load_cfg.get("optimizer", True)):
+            self.failure_predictor_optimizer.load_state_dict(loaded_dict["failure_predictor_optimizer_state_dict"])
+        return load_iteration
+
+    def _update_failure_predictor(self) -> tuple[float, float, float]:
+        inputs = self._failure_predictor_inputs()
+        targets = self._failure_predictor_targets()
+        batch_size = inputs.shape[0]
+        num_mini_batches = min(self.failure_predictor_num_mini_batches, batch_size)
+        mini_batch_size = batch_size // num_mini_batches
+
+        mean_loss = 0.0
+        num_updates = 0
+        for _ in range(self.failure_predictor_num_epochs):
+            indices = torch.randperm(num_mini_batches * mini_batch_size, device=self.device)
+            for mini_batch_idx in range(num_mini_batches):
+                start = mini_batch_idx * mini_batch_size
+                stop = (mini_batch_idx + 1) * mini_batch_size
+                batch_idx = indices[start:stop]
+                logits = self.failure_predictor(inputs[batch_idx])
+                loss = self.failure_predictor_loss(logits, targets[batch_idx])
+
+                self.failure_predictor_optimizer.zero_grad()
+                loss.backward()
+                if self.is_multi_gpu:
+                    self._reduce_failure_predictor_parameters()
+                nn.utils.clip_grad_norm_(self.failure_predictor.parameters(), self.max_grad_norm)
+                self.failure_predictor_optimizer.step()
+
+                mean_loss += loss.item()
+                num_updates += 1
+
+        with torch.inference_mode():
+            pred = torch.sigmoid(self.failure_predictor(inputs)).mean().item()
+        return mean_loss / max(num_updates, 1), targets.mean().item(), pred
+
+    def _failure_predictor_inputs(self) -> torch.Tensor:
+        observations = [
+            self.storage.observations[group].reshape(
+                self.storage.num_transitions_per_env,
+                self.storage.num_envs,
+                -1,
+            )
+            for group in self.failure_predictor_obs_groups
+        ]
+        obs = torch.cat(observations, dim=-1)
+        inputs = torch.cat((obs, self.storage.actions), dim=-1)
+        return inputs.flatten(0, 1).detach()
+
+    def _compute_failure_reward(self, obs: TensorDict, actions: torch.Tensor) -> torch.Tensor:
+        predictor_input = self._make_failure_predictor_input(obs, actions)
+        risk = torch.sigmoid(self.failure_predictor(predictor_input))
+        penalty = torch.clamp(risk - self.failure_reward_threshold, min=0.0)
+        return self.failure_reward_weight * penalty
+
+    def _make_failure_predictor_input(self, obs: TensorDict, actions: torch.Tensor) -> torch.Tensor:
+        observations = [obs[group].reshape(obs.batch_size[0], -1) for group in self.failure_predictor_obs_groups]
+        return torch.cat((*observations, actions), dim=-1).detach()
+
+    def _failure_predictor_targets(self) -> torch.Tensor:
+        dones = self.failure_dones
+        horizon = max(1, min(self.failure_predictor_horizon_steps, self.storage.num_transitions_per_env))
+        targets = torch.zeros_like(dones)
+        for offset in range(horizon):
+            risk = float(horizon - offset) / float(horizon)
+            targets[: self.storage.num_transitions_per_env - offset] = torch.maximum(
+                targets[: self.storage.num_transitions_per_env - offset],
+                dones[offset:] * risk,
+            )
+        return targets.flatten(0, 1).detach()
+
+    def broadcast_parameters(self) -> None:
+        super().broadcast_parameters()
+        model_params = [self.failure_predictor.state_dict()]
+        torch.distributed.broadcast_object_list(model_params, src=0)
+        self.failure_predictor.load_state_dict(model_params[0])
+
+    def _reduce_failure_predictor_parameters(self) -> None:
+        params = list(self.failure_predictor.parameters())
+        grads = [param.grad.view(-1) for param in params if param.grad is not None]
+        if not grads:
+            return
+        all_grads = torch.cat(grads)
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+        offset = 0
+        for param in params:
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                offset += numel
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> RGMT:
@@ -405,6 +588,20 @@ class RGMT(PPO):
         print(f"Critic Model: {critic}")
 
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
-        alg = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+        failure_predictor_obs_sets = cfg["algorithm"].pop("failure_predictor_obs_sets", ("actor", "command_window"))
+        failure_predictor_obs_groups = []
+        for obs_set in failure_predictor_obs_sets:
+            if obs_set not in cfg["obs_groups"]:
+                raise KeyError(f"cfg['obs_groups']['{obs_set}'] is required for the failure predictor.")
+            failure_predictor_obs_groups.extend(cfg["obs_groups"][obs_set])
+        alg = alg_class(
+            actor,
+            critic,
+            storage,
+            failure_predictor_obs_groups=failure_predictor_obs_groups,
+            device=device,
+            **cfg["algorithm"],
+            multi_gpu_cfg=cfg["multi_gpu"],
+        )
         alg.compile(cfg.get("torch_compile_mode"))
         return alg
