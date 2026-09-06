@@ -431,6 +431,8 @@ class RGMT(PPO):
         self.failure_replay_targets = torch.zeros(failure_replay_buffer_size, 1, device=self.device)
         self.failure_replay_pos = 0
         self.failure_replay_size = 0
+        self.failure_pending_inputs = torch.empty(0, self.storage.num_envs, input_dim, device=self.device)
+        self.failure_pending_dones = torch.empty(0, self.storage.num_envs, 1, device=self.device)
         self.failure_reward_sum = 0.0
         self.failure_reward_count = 0
 
@@ -483,14 +485,18 @@ class RGMT(PPO):
         return load_iteration
 
     def _update_failure_predictor(self) -> tuple[float, float, float]:
-        inputs = self._failure_predictor_inputs()
-        targets = self._failure_predictor_targets()
+        rollout_inputs = self._failure_predictor_inputs()
+        rollout_dones = self.failure_dones.detach()
+        inputs, targets = self._label_failure_predictor_samples(rollout_inputs, rollout_dones)
         current_inputs = inputs
         current_targets = targets
-        replay_inputs, replay_targets = self._sample_failure_replay(inputs.shape[0])
+        sample_size = rollout_inputs.shape[0] * rollout_inputs.shape[1] if inputs is None else inputs.shape[0]
+        replay_inputs, replay_targets = self._sample_failure_replay(sample_size)
         if replay_inputs is not None:
-            inputs = torch.cat((inputs, replay_inputs), dim=0)
-            targets = torch.cat((targets, replay_targets), dim=0)
+            inputs = replay_inputs if inputs is None else torch.cat((inputs, replay_inputs), dim=0)
+            targets = replay_targets if targets is None else torch.cat((targets, replay_targets), dim=0)
+        if inputs is None or targets is None:
+            return 0.0, 0.0, 0.0
         batch_size = inputs.shape[0]
         num_mini_batches = min(self.failure_predictor_num_mini_batches, batch_size)
         mini_batch_size = batch_size // num_mini_batches
@@ -517,9 +523,13 @@ class RGMT(PPO):
                 num_updates += 1
 
         with torch.inference_mode():
-            pred = torch.sigmoid(self.failure_predictor(current_inputs)).mean().item()
-        self._insert_failure_replay(current_inputs, current_targets)
-        return mean_loss / max(num_updates, 1), current_targets.mean().item(), pred
+            pred = torch.sigmoid(self.failure_predictor(current_inputs)).mean().item() if current_inputs is not None else 0.0
+        if current_inputs is not None and current_targets is not None:
+            self._insert_failure_replay(current_inputs, current_targets)
+            target_mean = current_targets.mean().item()
+        else:
+            target_mean = 0.0
+        return mean_loss / max(num_updates, 1), target_mean, pred
 
     def _failure_predictor_inputs(self) -> torch.Tensor:
         observations = [
@@ -532,7 +542,7 @@ class RGMT(PPO):
         ]
         obs = torch.cat(observations, dim=-1)
         inputs = torch.cat((obs, self.storage.actions), dim=-1)
-        return inputs.flatten(0, 1).detach()
+        return inputs.detach()
 
     def _failure_predictor_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         loss = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
@@ -581,17 +591,31 @@ class RGMT(PPO):
         observations = [obs[group].reshape(obs.batch_size[0], -1) for group in self.failure_predictor_obs_groups]
         return torch.cat((*observations, actions), dim=-1).detach()
 
-    def _failure_predictor_targets(self) -> torch.Tensor:
-        dones = self.failure_dones
-        horizon = max(1, min(self.failure_predictor_horizon_steps, self.storage.num_transitions_per_env))
-        targets = torch.zeros_like(dones)
+    def _label_failure_predictor_samples(
+        self, rollout_inputs: torch.Tensor, rollout_dones: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        horizon = max(1, self.failure_predictor_horizon_steps)
+        sequence_inputs = torch.cat((self.failure_pending_inputs, rollout_inputs), dim=0)
+        sequence_dones = torch.cat((self.failure_pending_dones, rollout_dones), dim=0)
+        num_labelable_steps = sequence_inputs.shape[0] - horizon + 1
+        if num_labelable_steps <= 0:
+            self.failure_pending_inputs = sequence_inputs.detach()
+            self.failure_pending_dones = sequence_dones.detach()
+            return None, None
+
+        label_inputs = sequence_inputs[:num_labelable_steps]
+        label_dones = sequence_dones[: num_labelable_steps + horizon - 1]
+        targets = torch.zeros_like(label_inputs[..., :1])
+        alive = torch.ones_like(targets)
         for offset in range(horizon):
             risk = float(horizon - offset) / float(horizon)
-            targets[: self.storage.num_transitions_per_env - offset] = torch.maximum(
-                targets[: self.storage.num_transitions_per_env - offset],
-                dones[offset:] * risk,
-            )
-        return targets.flatten(0, 1).detach()
+            offset_dones = label_dones[offset : offset + num_labelable_steps]
+            targets = torch.maximum(targets, alive * offset_dones * risk)
+            alive = alive * (1.0 - offset_dones)
+
+        self.failure_pending_inputs = sequence_inputs[num_labelable_steps:].detach()
+        self.failure_pending_dones = sequence_dones[num_labelable_steps:].detach()
+        return label_inputs.flatten(0, 1).detach(), targets.flatten(0, 1).detach()
 
     def broadcast_parameters(self) -> None:
         super().broadcast_parameters()
