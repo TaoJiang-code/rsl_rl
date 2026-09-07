@@ -107,12 +107,35 @@ class _CommandCrossAttentionBlock(nn.Module):
         return self.output_norm(latent).squeeze(1)
 
 
+class _FiniteScalarQuantizer(nn.Module):
+    """Straight-through finite scalar quantization for the command latent."""
+
+    def __init__(self, embedding_dim: int, num_tokens: int = 2, token_dim: int = 32, levels: int = 8) -> None:
+        super().__init__()
+        if num_tokens * token_dim != embedding_dim:
+            raise ValueError(
+                f"FSQ expects num_tokens * token_dim == embedding_dim, got {num_tokens} * {token_dim} != "
+                f"{embedding_dim}."
+            )
+        self.num_tokens = num_tokens
+        self.token_dim = token_dim
+        self.step = 2.0 / float(levels - 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bounded = torch.tanh(x)
+        tokens = bounded.reshape(*bounded.shape[:-1], self.num_tokens, self.token_dim)
+        quantized = torch.round((tokens + 1.0) / self.step) * self.step - 1.0
+        quantized = tokens + (quantized - tokens).detach()
+        return quantized.reshape_as(x)
+
+
 class RGMTActorModel(nn.Module):
     """RGMT actor with proprioceptive history encoding and command cross attention.
 
     The actor consumes:
     - ``actor`` obs set: current policy observation.
-    - ``history_obs_set``: 10-step proprioceptive history.
+    - ``history_obs_set``: proprioceptive state history.
+    - ``action_history_obs_set``: previous-action history.
     - ``command_obs_set``: reference command window ``[v_ref, w_ref, g_ref, q_ref]``.
     """
 
@@ -129,33 +152,43 @@ class RGMTActorModel(nn.Module):
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
         history_obs_set: str = "proprio_history",
+        action_history_obs_set: str = "action_history",
         command_obs_set: str = "command_window",
         history_length: int = 10,
         command_window_size: int = 11,
         embedding_dim: int = 128,
         history_hidden_dims: tuple[int, ...] | list[int] = (256, 256),
+        state_hidden_dims: tuple[int, ...] | list[int] | None = None,
+        action_hidden_dims: tuple[int, ...] | list[int] = (64,),
         command_hidden_dims: tuple[int, ...] | list[int] = (256, 256),
         dynamics_hidden_dims: tuple[int, ...] | list[int] = (128,),
         transformer_num_layers: int = 1,
         transformer_num_heads: int = 4,
         transformer_feedforward_dim: int = 512,
         cross_attention_heads: int = 4,
+        use_fsq: bool = True,
+        fsq_num_tokens: int = 2,
+        fsq_token_dim: int = 32,
+        fsq_levels: int = 8,
     ) -> None:
         super().__init__()
         self.obs_groups = obs_groups[obs_set]
-        self.history_obs_groups = obs_groups[history_obs_set]
+        self.state_history_obs_groups = obs_groups[history_obs_set]
+        self.action_history_obs_groups = obs_groups[action_history_obs_set]
         self.command_obs_groups = obs_groups[command_obs_set]
         self.history_length = history_length
         self.command_window_size = command_window_size
         self.embedding_dim = embedding_dim
 
         self.obs_dim = self._sum_flat_obs_dim(obs, self.obs_groups)
-        self.history_step_dim = self._infer_step_dim(obs, self.history_obs_groups, history_length)
+        self.state_step_dim = self._infer_step_dim(obs, self.state_history_obs_groups, history_length)
+        self.action_step_dim = self._infer_step_dim(obs, self.action_history_obs_groups, history_length)
         self.command_step_dim = self._infer_step_dim(obs, self.command_obs_groups, command_window_size)
 
         self.obs_normalization = obs_normalization
         self.obs_normalizer = EmpiricalNormalization(self.obs_dim) if obs_normalization else nn.Identity()
-        self.history_normalizer = EmpiricalNormalization(self.history_step_dim) if obs_normalization else nn.Identity()
+        self.state_normalizer = EmpiricalNormalization(self.state_step_dim) if obs_normalization else nn.Identity()
+        self.action_normalizer = EmpiricalNormalization(self.action_step_dim) if obs_normalization else nn.Identity()
         self.command_normalizer = EmpiricalNormalization(self.command_step_dim) if obs_normalization else nn.Identity()
 
         dist_cfg = distribution_cfg
@@ -167,8 +200,13 @@ class RGMTActorModel(nn.Module):
             self.distribution = None
             mlp_output_dim = output_dim
 
-        self.history_step_encoder = MLP(self.history_step_dim, embedding_dim, history_hidden_dims, activation)
-        self.history_position_encoding = _SinusoidalPositionEncoding(history_length, embedding_dim)
+        if state_hidden_dims is None:
+            state_hidden_dims = history_hidden_dims
+        self.state_step_encoder = MLP(self.state_step_dim, embedding_dim, state_hidden_dims, activation)
+        self.action_step_encoder = MLP(self.action_step_dim, embedding_dim, action_hidden_dims, activation)
+        self.state_encoder_norm = nn.LayerNorm(embedding_dim)
+        self.action_encoder_norm = nn.LayerNorm(embedding_dim)
+        self.history_position_encoding = _SinusoidalPositionEncoding(history_length * 2, embedding_dim)
         self.history_blocks = nn.ModuleList(
             [
                 _CausalTransformerBlock(
@@ -181,14 +219,25 @@ class RGMTActorModel(nn.Module):
         )
         self.dynamics_query_encoder = MLP(embedding_dim, embedding_dim, dynamics_hidden_dims, activation)
         self.command_step_encoder = MLP(self.command_step_dim, embedding_dim, command_hidden_dims, activation)
+        self.command_encoder_norm = nn.LayerNorm(embedding_dim)
         self.command_position_encoding = _SinusoidalPositionEncoding(command_window_size, embedding_dim)
         self.command_block = _CommandCrossAttentionBlock(
             embedding_dim=embedding_dim,
             num_heads=cross_attention_heads,
             feedforward_dim=transformer_feedforward_dim,
         )
+        self.command_quantizer = (
+            _FiniteScalarQuantizer(
+                embedding_dim=embedding_dim,
+                num_tokens=fsq_num_tokens,
+                token_dim=fsq_token_dim,
+                levels=fsq_levels,
+            )
+            if use_fsq
+            else nn.Identity()
+        )
 
-        actor_input_dim = self.obs_dim + embedding_dim + embedding_dim
+        actor_input_dim = self.obs_dim + embedding_dim
         self.mlp = MLP(actor_input_dim, mlp_output_dim, hidden_dims, activation)
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.mlp)
@@ -214,12 +263,24 @@ class RGMTActorModel(nn.Module):
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
     ) -> torch.Tensor:
         policy_obs = self.obs_normalizer(self._flatten_obs_groups(obs, self.obs_groups))
-        history = self.history_normalizer(self._sequence_obs_groups(obs, self.history_obs_groups, self.history_length))
+        state_history = self.state_normalizer(
+            self._sequence_obs_groups(obs, self.state_history_obs_groups, self.history_length)
+        )
+        action_history = self.action_normalizer(
+            self._sequence_obs_groups(obs, self.action_history_obs_groups, self.history_length)
+        )
         command = self.command_normalizer(self._sequence_obs_groups(obs, self.command_obs_groups, self.command_window_size))
 
-        history_tokens = self.history_position_encoding(self.history_step_encoder(history))
+        state_tokens = self.state_encoder_norm(self.state_step_encoder(state_history))
+        action_tokens = self.action_encoder_norm(self.action_step_encoder(action_history))
+        history_tokens = torch.stack((action_tokens, state_tokens), dim=2).reshape(
+            state_tokens.shape[0],
+            self.history_length * 2,
+            self.embedding_dim,
+        )
+        history_tokens = self.history_position_encoding(history_tokens)
         causal_mask = torch.triu(
-            torch.ones(self.history_length, self.history_length, device=history_tokens.device, dtype=torch.bool),
+            torch.ones(self.history_length * 2, self.history_length * 2, device=history_tokens.device, dtype=torch.bool),
             diagonal=1,
         )
         for block in self.history_blocks:
@@ -227,15 +288,25 @@ class RGMTActorModel(nn.Module):
         dynamics_latent = torch.max(history_tokens, dim=1).values
 
         command_query = self.dynamics_query_encoder(dynamics_latent)
-        command_tokens = self.command_position_encoding(self.command_step_encoder(command))
+        command_tokens = self.command_position_encoding(self.command_encoder_norm(self.command_step_encoder(command)))
         command_latent = self.command_block(command_query, command_tokens)
-        return torch.cat((policy_obs, dynamics_latent, command_latent), dim=-1)
+        command_latent = self.command_quantizer(command_latent)
+        return torch.cat((policy_obs, command_latent), dim=-1)
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.obs_normalization:
             self.obs_normalizer.update(self._flatten_obs_groups(obs, self.obs_groups))  # type: ignore
-            self.history_normalizer.update(  # type: ignore
-                self._sequence_obs_groups(obs, self.history_obs_groups, self.history_length).reshape(-1, self.history_step_dim)
+            self.state_normalizer.update(  # type: ignore
+                self._sequence_obs_groups(obs, self.state_history_obs_groups, self.history_length).reshape(
+                    -1,
+                    self.state_step_dim,
+                )
+            )
+            self.action_normalizer.update(  # type: ignore
+                self._sequence_obs_groups(obs, self.action_history_obs_groups, self.history_length).reshape(
+                    -1,
+                    self.action_step_dim,
+                )
             )
             self.command_normalizer.update(  # type: ignore
                 self._sequence_obs_groups(obs, self.command_obs_groups, self.command_window_size).reshape(
@@ -327,7 +398,8 @@ class _TorchRGMTActorModel(nn.Module):
 
     Forward inputs:
         policy_obs: concatenated current actor observations.
-        history_obs: ``[B, history_length, history_step_dim]``.
+        state_history_obs: ``[B, history_length, state_step_dim]``.
+        action_history_obs: ``[B, history_length, action_step_dim]``.
         command_obs: ``[B, command_window_size, command_step_dim]``.
     """
 
@@ -335,30 +407,51 @@ class _TorchRGMTActorModel(nn.Module):
     def __init__(self, model: RGMTActorModel) -> None:
         super().__init__()
         self.history_length = model.history_length
+        self.embedding_dim = model.embedding_dim
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
-        self.history_normalizer = copy.deepcopy(model.history_normalizer)
+        self.state_normalizer = copy.deepcopy(model.state_normalizer)
+        self.action_normalizer = copy.deepcopy(model.action_normalizer)
         self.command_normalizer = copy.deepcopy(model.command_normalizer)
-        self.history_step_encoder = copy.deepcopy(model.history_step_encoder)
+        self.state_step_encoder = copy.deepcopy(model.state_step_encoder)
+        self.action_step_encoder = copy.deepcopy(model.action_step_encoder)
+        self.state_encoder_norm = copy.deepcopy(model.state_encoder_norm)
+        self.action_encoder_norm = copy.deepcopy(model.action_encoder_norm)
         self.history_position_encoding = copy.deepcopy(model.history_position_encoding)
         self.history_blocks = copy.deepcopy(model.history_blocks)
         self.dynamics_query_encoder = copy.deepcopy(model.dynamics_query_encoder)
         self.command_step_encoder = copy.deepcopy(model.command_step_encoder)
+        self.command_encoder_norm = copy.deepcopy(model.command_encoder_norm)
         self.command_position_encoding = copy.deepcopy(model.command_position_encoding)
         self.command_block = copy.deepcopy(model.command_block)
+        self.command_quantizer = copy.deepcopy(model.command_quantizer)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
 
-    def forward(self, policy_obs: torch.Tensor, history_obs: torch.Tensor, command_obs: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        policy_obs: torch.Tensor,
+        state_history_obs: torch.Tensor,
+        action_history_obs: torch.Tensor,
+        command_obs: torch.Tensor,
+    ) -> torch.Tensor:
         policy_obs = self.obs_normalizer(policy_obs)
-        history = self.history_normalizer(history_obs)
+        state_history = self.state_normalizer(state_history_obs)
+        action_history = self.action_normalizer(action_history_obs)
         command = self.command_normalizer(command_obs)
 
-        history_tokens = self.history_position_encoding(self.history_step_encoder(history))
+        state_tokens = self.state_encoder_norm(self.state_step_encoder(state_history))
+        action_tokens = self.action_encoder_norm(self.action_step_encoder(action_history))
+        history_tokens = torch.stack((action_tokens, state_tokens), dim=2).reshape(
+            state_tokens.shape[0],
+            self.history_length * 2,
+            self.embedding_dim,
+        )
+        history_tokens = self.history_position_encoding(history_tokens)
         causal_mask = torch.triu(
-            torch.ones(self.history_length, self.history_length, device=history_tokens.device, dtype=torch.bool),
+            torch.ones(self.history_length * 2, self.history_length * 2, device=history_tokens.device, dtype=torch.bool),
             diagonal=1,
         )
         for block in self.history_blocks:
@@ -366,9 +459,10 @@ class _TorchRGMTActorModel(nn.Module):
         dynamics_latent = torch.max(history_tokens, dim=1).values
 
         command_query = self.dynamics_query_encoder(dynamics_latent)
-        command_tokens = self.command_position_encoding(self.command_step_encoder(command))
+        command_tokens = self.command_position_encoding(self.command_encoder_norm(self.command_step_encoder(command)))
         command_latent = self.command_block(command_query, command_tokens)
-        out = self.mlp(torch.cat((policy_obs, dynamics_latent, command_latent), dim=-1))
+        command_latent = self.command_quantizer(command_latent)
+        out = self.mlp(torch.cat((policy_obs, command_latent), dim=-1))
         return self.deterministic_output(out)
 
     @torch.jit.export
@@ -392,6 +486,7 @@ class RGMT(PPO):
             "actor",
             "critic",
             cfg["actor"].get("history_obs_set", "proprio_history"),
+            cfg["actor"].get("action_history_obs_set", "action_history"),
             cfg["actor"].get("command_obs_set", "command_window"),
         ]
         if cfg["algorithm"].get("rnd_cfg") is not None:
