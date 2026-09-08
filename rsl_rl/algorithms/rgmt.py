@@ -123,7 +123,7 @@ class _FiniteScalarQuantizer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bounded = torch.tanh(x)
-        tokens = bounded.reshape(*bounded.shape[:-1], self.num_tokens, self.token_dim)
+        tokens = bounded.reshape(-1, self.num_tokens, self.token_dim)
         quantized = torch.round((tokens + 1.0) / self.step) * self.step - 1.0
         quantized = tokens + (quantized - tokens).detach()
         return quantized.reshape_as(x)
