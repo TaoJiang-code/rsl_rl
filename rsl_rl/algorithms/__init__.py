@@ -12,6 +12,7 @@ from .dwaq_ppo import DWAQPPO
 from .parkour_ppo import ParkourPPO
 from .ppo import PPO
 from .rgmt import RGMT, RGMTActorModel
+from .rgmt_stage2 import RGMTStageII
 from .sonic_lora_ppo import LoRALinear, SonicActorModel, SonicCriticModel, SonicLoRAPPO
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "PPO",
     "RGMT",
     "RGMTActorModel",
+    "RGMTStageII",
     "SonicLoRAPPO",
     "SonicActorModel",
     "SonicCriticModel",
