@@ -184,6 +184,7 @@ class RGMTActorModel(nn.Module):
         self.state_step_dim = self._infer_step_dim(obs, self.state_history_obs_groups, history_length)
         self.action_step_dim = self._infer_step_dim(obs, self.action_history_obs_groups, history_length)
         self.command_step_dim = self._infer_step_dim(obs, self.command_obs_groups, command_window_size)
+        self._validate_schema(output_dim)
 
         self.obs_normalization = obs_normalization
         self.obs_normalizer = EmpiricalNormalization(self.obs_dim) if obs_normalization else nn.Identity()
@@ -241,6 +242,35 @@ class RGMTActorModel(nn.Module):
         self.mlp = MLP(actor_input_dim, mlp_output_dim, hidden_dims, activation)
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.mlp)
+
+    def _validate_schema(self, output_dim: int) -> None:
+        if self.history_length <= 0:
+            raise ValueError(f"RGMT history_length must be positive, got {self.history_length}.")
+        if self.command_window_size <= 0:
+            raise ValueError(f"RGMT command_window_size must be positive, got {self.command_window_size}.")
+
+        expected_state_step_dim = 6 + 2 * output_dim
+        if self.state_step_dim != expected_state_step_dim:
+            raise ValueError(
+                "RGMT state history schema mismatch. Expected each state token to be "
+                f"[projected_gravity(3), base_ang_vel(3), joint_pos({output_dim}), joint_vel({output_dim})] "
+                f"with dim {expected_state_step_dim}, got {self.state_step_dim}. "
+                f"Configured groups: {self.state_history_obs_groups}."
+            )
+        if self.action_step_dim != output_dim:
+            raise ValueError(
+                "RGMT action history schema mismatch. Expected each action token dim to match action dim "
+                f"{output_dim}, got {self.action_step_dim}. Configured groups: {self.action_history_obs_groups}."
+            )
+
+        expected_command_step_dim = 9 + output_dim
+        if self.command_step_dim != expected_command_step_dim:
+            raise ValueError(
+                "RGMT command window schema mismatch. Expected each command token to be "
+                f"[v_ref(3), w_ref(3), g_ref(3), q_ref({output_dim})] with dim "
+                f"{expected_command_step_dim}, got {self.command_step_dim}. "
+                f"Configured groups: {self.command_obs_groups}."
+            )
 
     def forward(
         self,

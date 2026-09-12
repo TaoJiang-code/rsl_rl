@@ -9,6 +9,7 @@ import torch
 from tensordict import TensorDict
 
 from rsl_rl.algorithms import RGMTStageII
+from rsl_rl.algorithms.rgmt_stage2 import TRACKING_FAILURES_EXTRA
 from rsl_rl.env import VecEnv
 from rsl_rl.runners.rgmt_runner import RGMTRunner
 
@@ -29,6 +30,8 @@ class RGMTStageIIRunner(RGMTRunner):
 
     def _step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
         obs, rewards, dones, extras = super()._step(actions)
+        termination_manager = self.env.unwrapped.termination_manager
+        extras[TRACKING_FAILURES_EXTRA] = termination_manager.terminated.to(self.env.device).clone()
         return self._append_stage2_role(obs), rewards, dones, extras
 
     def _append_stage2_role(self, obs: TensorDict) -> TensorDict:
