@@ -358,6 +358,10 @@ class RGMTActorModel(nn.Module):
         """Return a TorchScript-friendly deterministic RGMT actor."""
         return _TorchRGMTActorModel(self)
 
+    def as_onnx(self, verbose: bool = False) -> nn.Module:
+        """Return an ONNX-export-friendly deterministic RGMT actor."""
+        return _OnnxRGMTActorModel(self, verbose)
+
     @property
     def output_mean(self) -> torch.Tensor:
         return self.distribution.mean  # type: ignore
@@ -498,6 +502,40 @@ class _TorchRGMTActorModel(nn.Module):
     @torch.jit.export
     def reset(self) -> None:
         pass
+
+
+class _OnnxRGMTActorModel(_TorchRGMTActorModel):
+    """Exportable RGMT actor for ONNX."""
+
+    is_recurrent: bool = False
+
+    def __init__(self, model: RGMTActorModel, verbose: bool) -> None:
+        super().__init__(model)
+        self.verbose = verbose
+        self.policy_obs_dim = model.obs_dim
+        self.state_step_dim = model.state_step_dim
+        self.action_step_dim = model.action_step_dim
+        self.command_step_dim = model.command_step_dim
+        self.command_window_size = model.command_window_size
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
+        """Return representative dummy inputs for ONNX tracing."""
+        return (
+            torch.zeros(1, self.policy_obs_dim),
+            torch.zeros(1, self.history_length, self.state_step_dim),
+            torch.zeros(1, self.history_length, self.action_step_dim),
+            torch.zeros(1, self.command_window_size, self.command_step_dim),
+        )
+
+    @property
+    def input_names(self) -> list[str]:
+        """Return ONNX input tensor names."""
+        return ["policy_obs", "state_history_obs", "action_history_obs", "command_obs"]
+
+    @property
+    def output_names(self) -> list[str]:
+        """Return ONNX output tensor names."""
+        return ["actions"]
 
 
 class RGMT(PPO):
