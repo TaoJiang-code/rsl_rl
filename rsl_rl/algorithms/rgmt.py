@@ -20,6 +20,7 @@ from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, unpad_trajectories
 
 
+
 class _SinusoidalPositionEncoding(nn.Module):
     """Fixed sinusoidal position encoding for short RGMT temporal windows."""
 
