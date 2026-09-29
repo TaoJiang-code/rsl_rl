@@ -7,5 +7,6 @@
 
 from .replay_buffer import ReplayBuffer
 from .rollout_storage import RolloutStorage
+from .sac_replay_buffer import SACReplayBatch, SACReplayBuffer
 
-__all__ = ["ReplayBuffer", "RolloutStorage"]
+__all__ = ["ReplayBuffer", "RolloutStorage", "SACReplayBatch", "SACReplayBuffer"]

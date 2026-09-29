@@ -9,6 +9,7 @@ from .amp_on_policy_runner import AmpOnPolicyRunner
 from .bfm_dagger_runner import BFMDaggerRunner
 from .distillation_runner import DistillationRunner
 from .dwaq_runner import DWAQRunner
+from .fast_sac_runner import FastSACRunner
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
 from .parkour_on_policy_runner import ParkourOnPolicyRunner
 from .rgmt_runner import RGMTRunner
@@ -21,6 +22,7 @@ __all__ = [
     "BFMDaggerRunner",
     "DistillationRunner",
     "DWAQRunner",
+    "FastSACRunner",
     "OnPolicyRunner",
     "ParkourOnPolicyRunner",
     "RGMTRunner",
