@@ -43,6 +43,51 @@ class ResidualConv1dBlock(nn.Module):
         return self.norm(x + y)
 
 
+class DownsampleResNetBlock(nn.Module):
+    """Residual temporal block that halves the sequence length."""
+
+    def __init__(self, channels: int, activation: str = "gelu") -> None:
+        super().__init__()
+        act = nn.GELU() if activation == "gelu" else nn.ELU()
+        self.downsample = nn.Conv1d(channels, channels, kernel_size=4, stride=2, padding=1)
+        self.skip = nn.Conv1d(channels, channels, kernel_size=1, stride=2)
+        self.net = nn.Sequential(
+            act,
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            act,
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+        )
+        self.norm = RMSNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, C]
+        x_ch = x.transpose(1, 2)
+        y = self.downsample(x_ch)
+        y = y + self.skip(x_ch)
+        y = y + self.net(y)
+        return self.norm(y.transpose(1, 2))
+
+
+class UpsampleConv1dBlock(nn.Module):
+    """Temporal Conv1D decoder block that doubles the sequence length."""
+
+    def __init__(self, channels: int, activation: str = "gelu") -> None:
+        super().__init__()
+        act = nn.GELU() if activation == "gelu" else nn.ELU()
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            act,
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+        )
+        self.norm = RMSNorm(channels)
+
+    def forward(self, x: torch.Tensor, target_length: int) -> torch.Tensor:
+        # x: [B, T, C]
+        y = F.interpolate(x.transpose(1, 2), size=target_length, mode="linear", align_corners=False)
+        y = y + self.net(y)
+        return self.norm(y.transpose(1, 2))
+
+
 class MotionBridgeRetargeter(nn.Module):
     """Stage-1 supervised retargeter: SMPL sequence -> GMR/G1 robot sequence.
 
@@ -69,7 +114,13 @@ class MotionBridgeRetargeter(nn.Module):
 
         self.input_projection = nn.Linear(input_dim, hidden_dim)
         self.input_norm = RMSNorm(hidden_dim)
-        self.conv_blocks = nn.ModuleList([ResidualConv1dBlock(hidden_dim) for _ in range(num_conv_blocks)])
+        self.downsample_blocks = nn.ModuleList([DownsampleResNetBlock(hidden_dim) for _ in range(num_conv_blocks)])
+        self.encoder_conv = nn.Sequential(
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+        )
+        self.encoder_norm = RMSNorm(hidden_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_attention_heads,
@@ -80,12 +131,13 @@ class MotionBridgeRetargeter(nn.Module):
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
-        self.output_conv = nn.Sequential(
+        self.decoder_conv = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
         )
-        self.output_norm = RMSNorm(hidden_dim)
+        self.decoder_norm = RMSNorm(hidden_dim)
+        self.upsample_blocks = nn.ModuleList([UpsampleConv1dBlock(hidden_dim) for _ in range(num_conv_blocks)])
         self.output_projection = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, smpl_sequence: torch.Tensor) -> torch.Tensor:
@@ -97,11 +149,20 @@ class MotionBridgeRetargeter(nn.Module):
         Returns:
             Tensor with shape [batch, time, output_dim].
         """
+        input_length = smpl_sequence.shape[1]
+        lengths = [input_length]
+
         x = self.input_norm(self.input_projection(smpl_sequence))
-        for block in self.conv_blocks:
+        for block in self.downsample_blocks:
             x = block(x)
+            lengths.append(x.shape[1])
+
+        x = self.encoder_norm(x + self.encoder_conv(x.transpose(1, 2)).transpose(1, 2))
         x = self.transformer(x)
-        x = self.output_norm(x + self.output_conv(x.transpose(1, 2)).transpose(1, 2))
+
+        x = self.decoder_norm(x + self.decoder_conv(x.transpose(1, 2)).transpose(1, 2))
+        for block, target_length in zip(self.upsample_blocks, reversed(lengths[:-1])):
+            x = block(x, target_length)
         return self.output_projection(x)
 
 
