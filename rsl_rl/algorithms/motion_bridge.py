@@ -98,7 +98,7 @@ class MotionBridgeRetargeter(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 75,
+        input_dim: int = 140,
         output_dim: int = 36,
         hidden_dim: int = 512,
         num_conv_blocks: int = 4,
