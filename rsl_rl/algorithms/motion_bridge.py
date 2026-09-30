@@ -63,7 +63,12 @@ class DownsampleResNetBlock(nn.Module):
         # x: [B, T, C]
         x_ch = x.transpose(1, 2)
         y = self.downsample(x_ch)
-        y = y + self.skip(x_ch)
+        skip = self.skip(x_ch)
+        if y.shape[-1] != skip.shape[-1]:
+            target_length = min(y.shape[-1], skip.shape[-1])
+            y = y[..., :target_length]
+            skip = skip[..., :target_length]
+        y = y + skip
         y = y + self.net(y)
         return self.norm(y.transpose(1, 2))
 
