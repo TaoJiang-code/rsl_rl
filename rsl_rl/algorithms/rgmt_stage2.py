@@ -561,7 +561,7 @@ class RGMTStageII(RGMT):
         student_actions = self.actor(consolidation_obs)
         with torch.no_grad():
             reference_actions = self.reference_actor(consolidation_obs)
-        return torch.mean((student_actions - reference_actions).pow(2))
+        return (student_actions - reference_actions).pow(2).sum(dim=-1).mean()
 
     def _compute_valid_acquisition_ratio(self) -> float:
         if hasattr(self.storage, "valid_sample_counts"):
@@ -595,11 +595,11 @@ class RGMTStageII(RGMT):
         if hasattr(self.storage, "record_tracking_failures"):
             failures = extras.get(TRACKING_FAILURES_EXTRA)
             if failures is None:
-                time_outs = extras.get("time_outs")
-                if time_outs is None:
-                    failures = dones.reshape(-1).bool()
-                else:
-                    failures = dones.reshape(-1).bool() & ~time_outs.reshape(-1).bool()
+                raise RuntimeError(
+                    "RGMTStageII requires a true tracking failure mask. "
+                    f"Pass extras[{TRACKING_FAILURES_EXTRA!r}] from the environment's terminated signal "
+                    "via RGMTStageIIRunner; do not derive failures from done/time_outs."
+                )
             self.storage.record_tracking_failures(failures)
         super().process_env_step(obs, rewards, dones, extras)
 
