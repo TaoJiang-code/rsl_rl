@@ -370,6 +370,23 @@ class RGMTStageII(RGMT):
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
+        is_stage2_checkpoint = (
+            "reference_actor_state_dict" in loaded_dict
+            or "teacher_actor_state_dict" in loaded_dict
+            or "stage2_valid_acq_ratio_ema" in loaded_dict
+        )
+        if load_cfg is None and not is_stage2_checkpoint:
+            # Stage II commonly starts from a Stage I policy checkpoint. Reuse
+            # the policy/value weights, but start Stage II with a fresh optimizer
+            # and learning-rate schedule; otherwise a collapsed Stage I adaptive
+            # KL state can make Stage II appear frozen from the first update.
+            load_cfg = {
+                "actor": True,
+                "critic": True,
+                "optimizer": False,
+                "iteration": False,
+                "rnd": False,
+            }
         load_iteration = super().load(loaded_dict, load_cfg, strict)
         if "reference_actor_state_dict" in loaded_dict:
             self.reference_actor.load_state_dict(loaded_dict["reference_actor_state_dict"], strict=strict)
@@ -387,6 +404,8 @@ class RGMTStageII(RGMT):
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_consolidation_loss = 0
+        mean_kl = 0
+        num_kl_updates = 0
         mean_valid_acq_ratio = self._compute_valid_acquisition_ratio()
         self.lambda_con = self._compute_lambda_con(mean_valid_acq_ratio)
 
@@ -442,6 +461,9 @@ class RGMTStageII(RGMT):
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
+
+                    mean_kl += float(kl_mean.item())
+                    num_kl_updates += 1
 
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
@@ -532,10 +554,16 @@ class RGMTStageII(RGMT):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "stage2_consolidation": mean_consolidation_loss,
+            "stage2_consolidation_weighted": self.lambda_con * mean_consolidation_loss,
             "stage2_lambda_con": self.lambda_con,
             "stage2_valid_acq_ratio": mean_valid_acq_ratio,
+            "stage2_valid_acq_ratio_ema": (
+                self.lambda_rho_ref if self.valid_acq_ratio_ema is None else self.valid_acq_ratio_ema
+            ),
             "stage2_star_pool_size": float(getattr(self.storage, "last_star_pool_size", 0)),
         }
+        if num_kl_updates > 0:
+            loss_dict["stage2_kl"] = mean_kl / num_kl_updates
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
