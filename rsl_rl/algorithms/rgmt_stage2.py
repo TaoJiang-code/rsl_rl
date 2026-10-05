@@ -72,11 +72,13 @@ class StageIIStarRolloutStorage(RolloutStorage):
         self.tracking_failures = torch.zeros(
             num_transitions_per_env, num_envs, 1, dtype=torch.bool, device=device
         )
+        self.tracking_failure_sources = torch.zeros(num_transitions_per_env, dtype=torch.uint8, device=device)
         self.last_star_pool_size = 0
 
     def clear(self) -> None:
         super().clear()
         self.tracking_failures.zero_()
+        self.tracking_failure_sources.zero_()
 
     def record_tracking_failures(self, failures: torch.Tensor) -> None:
         if self.step >= self.num_transitions_per_env:
@@ -85,6 +87,7 @@ class StageIIStarRolloutStorage(RolloutStorage):
         if mask.shape != (self.num_envs,):
             raise ValueError(f"tracking failure mask must have shape {(self.num_envs,)}, got {tuple(mask.shape)}.")
         self.tracking_failures[self.step, :, 0].copy_(mask)
+        self.tracking_failure_sources[self.step] = 1
 
     @staticmethod
     def _prefix_before_first_event(events: torch.Tensor) -> torch.Tensor:
@@ -93,11 +96,54 @@ class StageIIStarRolloutStorage(RolloutStorage):
         return prior_events == 0
 
     def valid_sample_counts(self) -> tuple[int, int]:
-        valid = self._prefix_before_first_event(self.tracking_failures.squeeze(-1))
-        return (
-            int(valid[:, : self.env_split].sum().item()),
-            int(valid[:, self.env_split :].sum().item()),
-        )
+        diagnostics = self.valid_sample_diagnostics()
+        return int(diagnostics["valid_acq_samples"]), int(diagnostics["valid_con_samples"])
+
+    def valid_sample_diagnostics(self) -> dict[str, int]:
+        populated_steps = self.num_transitions_per_env if self.step == 0 else self.step
+        sources = self.tracking_failure_sources[:populated_steps]
+        if bool((sources == 0).any()):
+            missing = int((sources == 0).sum().item())
+            raise RuntimeError(
+                f"Missing tracking failure masks for {missing}/{populated_steps} rollout steps. "
+                f"Pass extras[{TRACKING_FAILURES_EXTRA!r}] from RGMTStageIIRunner."
+            )
+
+        failures = self.tracking_failures[:populated_steps].squeeze(-1)
+        dones = self.dones[:populated_steps].squeeze(-1).bool()
+        valid_failure = self._prefix_before_first_event(failures)
+        valid_done = self._prefix_before_first_event(dones)
+        non_failure_dones = dones & ~failures
+
+        def role_counts(mask: torch.Tensor) -> tuple[int, int]:
+            return (
+                int(mask[:, : self.env_split].sum().item()),
+                int(mask[:, self.env_split :].sum().item()),
+            )
+
+        n_acq, n_con = role_counts(valid_failure)
+        done_acq, done_con = role_counts(dones)
+        failure_acq, failure_con = role_counts(failures)
+        non_failure_done_acq, non_failure_done_con = role_counts(non_failure_dones)
+        done_prefix_acq, done_prefix_con = role_counts(valid_done)
+        return {
+            "valid_acq_samples": n_acq,
+            "valid_con_samples": n_con,
+            "failure_prefix_valid_acq_samples": n_acq,
+            "failure_prefix_valid_con_samples": n_con,
+            "combined_done_prefix_valid_acq_samples": done_prefix_acq,
+            "combined_done_prefix_valid_con_samples": done_prefix_con,
+            "valid_acq_gain_vs_combined_done": n_acq - done_prefix_acq,
+            "valid_con_gain_vs_combined_done": n_con - done_prefix_con,
+            "tracking_failure_acq_events": failure_acq,
+            "tracking_failure_con_events": failure_con,
+            "combined_done_acq_events": done_acq,
+            "combined_done_con_events": done_con,
+            "non_failure_done_acq_events": non_failure_done_acq,
+            "non_failure_done_con_events": non_failure_done_con,
+            "tracking_failure_explicit_steps": int((sources == 1).sum().item()),
+            "tracking_failure_missing_steps": int((sources == 0).sum().item()),
+        }
 
     def _star_meta(self) -> tuple[torch.Tensor, torch.Tensor]:
         if STAR_GROUP not in self.observations:
@@ -311,6 +357,7 @@ class RGMTStageII(RGMT):
         self.reference_actor.requires_grad_(False)
         self.valid_acq_ratio_ema: float | None = None
         self.lambda_con = 0.0
+        self._last_valid_sample_diagnostics: dict[str, int] = {}
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> "RGMTStageII":
@@ -589,6 +636,10 @@ class RGMTStageII(RGMT):
         }
         if num_kl_updates > 0:
             loss_dict["stage2_kl"] = mean_kl / num_kl_updates
+        for key, value in getattr(self, "_last_valid_sample_diagnostics", {}).items():
+            if key in {"valid_acq_samples", "valid_con_samples"}:
+                continue
+            loss_dict[f"stage2_{key}"] = float(value)
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
@@ -623,9 +674,16 @@ class RGMTStageII(RGMT):
 
     def _compute_valid_sample_stats(self) -> tuple[float, int, int]:
         if hasattr(self.storage, "valid_sample_counts"):
-            n_acq, n_con = self.storage.valid_sample_counts()
+            diagnostics = {}
+            if hasattr(self.storage, "valid_sample_diagnostics"):
+                diagnostics = self.storage.valid_sample_diagnostics()
+                n_acq = int(diagnostics["valid_acq_samples"])
+                n_con = int(diagnostics["valid_con_samples"])
+            else:
+                n_acq, n_con = self.storage.valid_sample_counts()
             total = n_acq + n_con
             ratio = float(n_acq / total) if total > 0 else self.lambda_rho_ref
+            self._last_valid_sample_diagnostics = diagnostics
             return ratio, int(n_acq), int(n_con)
         if self.consolidation_obs_key not in self.storage.observations:
             return 1.0, 0, 0
@@ -663,6 +721,15 @@ class RGMTStageII(RGMT):
                     f"Pass extras[{TRACKING_FAILURES_EXTRA!r}] from the environment's terminated signal "
                     "via RGMTStageIIRunner; do not derive failures from done/time_outs."
                 )
+            failures = failures.reshape(-1).bool()
+            dones_flat = dones.reshape(-1).bool()
+            if failures.shape != dones_flat.shape:
+                raise ValueError(
+                    "tracking failure and done masks must have the same shape; "
+                    f"got {tuple(failures.shape)} and {tuple(dones_flat.shape)}."
+                )
+            if bool((failures & ~dones_flat).any()):
+                raise ValueError("A tracking failure must also be marked done on the same step.")
             self.storage.record_tracking_failures(failures)
         super().process_env_step(obs, rewards, dones, extras)
 
