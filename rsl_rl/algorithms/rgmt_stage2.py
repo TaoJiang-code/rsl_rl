@@ -609,11 +609,13 @@ class RGMTStageII(RGMT):
 
     def _compute_lambda_con(self, valid_acq_ratio: float) -> float:
         if self.valid_acq_ratio_ema is None:
-            self.valid_acq_ratio_ema = valid_acq_ratio
-        else:
-            self.valid_acq_ratio_ema = (
-                self.lambda_beta * self.valid_acq_ratio_ema + (1.0 - self.lambda_beta) * valid_acq_ratio
-            )
+            # GMTrack/PACE Eq. (18): initialize the smoothed progress ratio at
+            # rho_ref so lambda_con starts at lambda_base instead of jumping to
+            # the first rollout's acquisition ratio.
+            self.valid_acq_ratio_ema = self.lambda_rho_ref
+        self.valid_acq_ratio_ema = (
+            self.lambda_beta * self.valid_acq_ratio_ema + (1.0 - self.lambda_beta) * valid_acq_ratio
+        )
         value = self.lambda_base + self.lambda_kappa * max(0.0, self.valid_acq_ratio_ema - self.lambda_rho_ref)
         return float(min(self.lambda_con_max, max(0.0, value)))
 
