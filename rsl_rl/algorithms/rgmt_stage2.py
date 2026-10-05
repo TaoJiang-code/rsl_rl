@@ -406,8 +406,12 @@ class RGMTStageII(RGMT):
         mean_consolidation_loss = 0
         mean_kl = 0
         num_kl_updates = 0
-        mean_valid_acq_ratio = self._compute_valid_acquisition_ratio()
+        mean_valid_acq_ratio, valid_acq_samples, valid_con_samples = self._compute_valid_sample_stats()
         self.lambda_con = self._compute_lambda_con(mean_valid_acq_ratio)
+        actor_grad_norm_sum = 0.0
+        critic_grad_norm_sum = 0.0
+        actor_grad_norm_max = 0.0
+        critic_grad_norm_max = 0.0
 
         mean_rnd_loss = 0 if self.rnd else None
         mean_symmetry_loss = 0 if self.symmetry else None
@@ -454,13 +458,19 @@ class RGMTStageII(RGMT):
                 with torch.inference_mode():
                     kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
                     if torch.any(is_acquisition):
-                        kl_mean = torch.mean(kl[is_acquisition])
+                        selected_kl = kl[is_acquisition]
+                        kl_stats = torch.stack(
+                            (
+                                selected_kl.sum(),
+                                torch.tensor(float(selected_kl.numel()), device=self.device),
+                            )
+                        )
                     else:
-                        kl_mean = torch.zeros((), device=self.device)
+                        kl_stats = torch.zeros(2, device=self.device)
 
                     if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
+                        torch.distributed.all_reduce(kl_stats, op=torch.distributed.ReduceOp.SUM)
+                    kl_mean = kl_stats[0] / kl_stats[1].clamp_min(1.0)
 
                     mean_kl += float(kl_mean.item())
                     num_kl_updates += 1
@@ -505,7 +515,12 @@ class RGMTStageII(RGMT):
                 entropy_loss = torch.zeros((), device=self.device)
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_loss
-            consolidation_loss = self._compute_consolidation_loss(original_observations, is_consolidation)
+            student_action_mean = self.actor.output_mean[:original_batch_size]
+            consolidation_loss = self._compute_consolidation_loss(
+                original_observations,
+                is_consolidation,
+                student_action_mean,
+            )
             loss = loss + self.lambda_con * consolidation_loss
 
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -524,8 +539,12 @@ class RGMTStageII(RGMT):
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            actor_grad_norm = float(nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm).item())
+            critic_grad_norm = float(nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm).item())
+            actor_grad_norm_sum += actor_grad_norm
+            critic_grad_norm_sum += critic_grad_norm
+            actor_grad_norm_max = max(actor_grad_norm_max, actor_grad_norm)
+            critic_grad_norm_max = max(critic_grad_norm_max, critic_grad_norm)
             self.optimizer.step()
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -560,7 +579,13 @@ class RGMTStageII(RGMT):
             "stage2_valid_acq_ratio_ema": (
                 self.lambda_rho_ref if self.valid_acq_ratio_ema is None else self.valid_acq_ratio_ema
             ),
+            "stage2_valid_acq_samples": float(valid_acq_samples),
+            "stage2_valid_con_samples": float(valid_con_samples),
             "stage2_star_pool_size": float(getattr(self.storage, "last_star_pool_size", 0)),
+            "stage2_actor_grad_norm_mean": actor_grad_norm_sum / num_updates,
+            "stage2_actor_grad_norm_max": actor_grad_norm_max,
+            "stage2_critic_grad_norm_mean": critic_grad_norm_sum / num_updates,
+            "stage2_critic_grad_norm_max": critic_grad_norm_max,
         }
         if num_kl_updates > 0:
             loss_dict["stage2_kl"] = mean_kl / num_kl_updates
@@ -581,31 +606,39 @@ class RGMTStageII(RGMT):
         is_acquisition = observations[self.consolidation_obs_key].reshape(-1) > 0.5
         return is_acquisition, ~is_acquisition
 
-    def _compute_consolidation_loss(self, observations, consolidation_mask: torch.Tensor) -> torch.Tensor:
+    def _compute_consolidation_loss(
+        self,
+        observations,
+        consolidation_mask: torch.Tensor,
+        student_action_mean: torch.Tensor,
+    ) -> torch.Tensor:
         if not torch.any(consolidation_mask):
             return torch.zeros((), device=self.device)
 
         consolidation_obs = observations[consolidation_mask]
-        student_actions = self.actor(consolidation_obs)
+        student_actions = student_action_mean[consolidation_mask]
         with torch.no_grad():
             reference_actions = self.reference_actor(consolidation_obs)
         return (student_actions - reference_actions).pow(2).sum(dim=-1).mean()
 
-    def _compute_valid_acquisition_ratio(self) -> float:
+    def _compute_valid_sample_stats(self) -> tuple[float, int, int]:
         if hasattr(self.storage, "valid_sample_counts"):
             n_acq, n_con = self.storage.valid_sample_counts()
             total = n_acq + n_con
-            return float(n_acq / total) if total > 0 else self.lambda_rho_ref
+            ratio = float(n_acq / total) if total > 0 else self.lambda_rho_ref
+            return ratio, int(n_acq), int(n_con)
         if self.consolidation_obs_key not in self.storage.observations:
-            return 1.0
+            return 1.0, 0, 0
         is_acquisition = self.storage.observations[self.consolidation_obs_key].reshape(-1) > 0.5
         not_done = (1.0 - self.storage.dones.reshape(-1).float()) > 0.5
         valid_acquisition = is_acquisition & not_done
         valid_consolidation = (~is_acquisition) & not_done
         valid_total = valid_acquisition.sum() + valid_consolidation.sum()
         if valid_total.item() == 0:
-            return 0.0
-        return float((valid_acquisition.sum().float() / valid_total.float()).item())
+            return 0.0, 0, 0
+        n_acq = int(valid_acquisition.sum().item())
+        n_con = int(valid_consolidation.sum().item())
+        return float((valid_acquisition.sum().float() / valid_total.float()).item()), n_acq, n_con
 
     def _compute_lambda_con(self, valid_acq_ratio: float) -> float:
         if self.valid_acq_ratio_ema is None:
