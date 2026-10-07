@@ -182,22 +182,24 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
 
     def _mixed_command_and_base_joint_pos(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
         reference_command = self._sequence_obs_groups(obs, self.command_obs_groups, self.command_window_size)
-        smpl_window = self._sequence_obs_groups(obs, self.smpl_obs_groups, self.command_window_size)
-        bridge_target = self._motion_bridge_target(smpl_window)
-        self._last_bridge_prediction = bridge_target
-        bridge_command = bridge_target
-
         command_source = self._flatten_obs_groups(obs, self.command_source_obs_groups)
-        smpl_mask = (command_source[:, :1] > 0.5).to(reference_command.dtype).reshape(-1, 1, 1)
-        command = reference_command * (1.0 - smpl_mask) + bridge_command * smpl_mask
+        smpl_rows = command_source[:, 0] > 0.5
+
+        command = reference_command.clone()
+        bridge_prediction = reference_command.new_zeros(reference_command.shape)
 
         center_id = self.command_window_size // 2
         reference_base_joint_pos = reference_command[:, center_id, 9 : 9 + self._output_dim]
-        bridge_base_joint_pos = self._paper_target_joint_pos(bridge_target)[:, center_id]
-        base_joint_pos = (
-            reference_base_joint_pos * (1.0 - smpl_mask[:, 0])
-            + bridge_base_joint_pos * smpl_mask[:, 0]
-        )
+        base_joint_pos = reference_base_joint_pos.clone()
+
+        if torch.any(smpl_rows):
+            smpl_window = self._sequence_obs_groups(obs, self.smpl_obs_groups, self.command_window_size)
+            bridge_target = self._motion_bridge_target(smpl_window[smpl_rows])
+            command[smpl_rows] = bridge_target
+            bridge_prediction[smpl_rows] = bridge_target
+            base_joint_pos[smpl_rows] = self._paper_target_joint_pos(bridge_target)[:, center_id]
+
+        self._last_bridge_prediction = bridge_prediction
         return command, base_joint_pos
 
     def _motion_bridge_target(self, smpl_window: torch.Tensor) -> torch.Tensor:
@@ -208,11 +210,11 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
     def motion_bridge_prediction_and_reference(
         self, obs: TensorDict, prediction: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        smpl_window = self._sequence_obs_groups(obs, self.smpl_obs_groups, self.command_window_size)
         target_window = self._sequence_obs_groups(obs, self.bridge_target_obs_groups, self.command_window_size)
         command_source = self._flatten_obs_groups(obs, self.command_source_obs_groups)
-        smpl_mask = (command_source[:, :1] > 0.5).to(smpl_window.dtype)
+        smpl_mask = (command_source[:, :1] > 0.5).to(target_window.dtype)
         if prediction is None or prediction.shape[:2] != target_window.shape[:2]:
+            smpl_window = self._sequence_obs_groups(obs, self.smpl_obs_groups, self.command_window_size)
             prediction = self._motion_bridge_target(smpl_window)
         return prediction, target_window, smpl_mask
 
