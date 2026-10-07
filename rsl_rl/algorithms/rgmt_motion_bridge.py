@@ -66,6 +66,7 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         self.motion_bridge_dt = float(motion_bridge_dt)
         self._output_dim = output_dim
         self._last_bridge_prediction = None
+        self.freeze_motion_bridge = bool(freeze_motion_bridge)
 
         checkpoint_path = Path(motion_bridge_checkpoint).expanduser()
         if not checkpoint_path.is_file():
@@ -118,9 +119,10 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
             persistent=True,
         )
 
-        if freeze_motion_bridge:
+        if self.freeze_motion_bridge:
             for param in self.motion_bridge.parameters():
                 param.requires_grad_(False)
+            self.motion_bridge.eval()
 
     def forward(
         self,
@@ -203,6 +205,12 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         return command, base_joint_pos
 
     def _motion_bridge_target(self, smpl_window: torch.Tensor) -> torch.Tensor:
+        if self.freeze_motion_bridge:
+            with torch.no_grad():
+                return self._motion_bridge_target_impl(smpl_window)
+        return self._motion_bridge_target_impl(smpl_window)
+
+    def _motion_bridge_target_impl(self, smpl_window: torch.Tensor) -> torch.Tensor:
         smpl_norm = (smpl_window - self.motion_bridge_input_mean) / self.motion_bridge_input_std
         target_norm = self.motion_bridge(smpl_norm)
         return target_norm * self.motion_bridge_target_std + self.motion_bridge_target_mean
@@ -415,20 +423,24 @@ class RGMTMotionBridge(RGMT):
             self.optimizer.register_step_pre_hook(lambda optimizer, args, kwargs: self._set_learning_rate(self.learning_rate))
 
     def _rebuild_motion_bridge_optimizer(self, optimizer: str, learning_rate: float) -> None:
-        motion_bridge_params = list(self._raw_actor.motion_bridge.parameters())
-        motion_bridge_param_ids = {id(param) for param in motion_bridge_params}
+        all_motion_bridge_params = list(self._raw_actor.motion_bridge.parameters())
+        motion_bridge_params = [param for param in all_motion_bridge_params if param.requires_grad]
+        motion_bridge_param_ids = {id(param) for param in all_motion_bridge_params}
         actor_regular_params = [
-            param for param in self.actor.parameters() if id(param) not in motion_bridge_param_ids
+            param for param in self.actor.parameters() if id(param) not in motion_bridge_param_ids and param.requires_grad
         ]
-        critic_params = list(self.critic.parameters())
+        critic_params = [param for param in self.critic.parameters() if param.requires_grad]
         param_groups = [
             {"params": chain(actor_regular_params, critic_params), "lr": learning_rate, "name": "rgmt"},
-            {
-                "params": motion_bridge_params,
-                "lr": learning_rate * self.motion_bridge_lr_scale,
-                "name": "motion_bridge",
-            },
         ]
+        if motion_bridge_params:
+            param_groups.append(
+                {
+                    "params": motion_bridge_params,
+                    "lr": learning_rate * self.motion_bridge_lr_scale,
+                    "name": "motion_bridge",
+                }
+            )
         self.optimizer = resolve_optimizer(optimizer)(param_groups, lr=learning_rate)  # type: ignore
 
     def _set_learning_rate(self, learning_rate: float) -> None:
