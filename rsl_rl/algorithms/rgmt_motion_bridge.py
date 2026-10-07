@@ -11,8 +11,12 @@ from tensordict import TensorDict
 
 from rsl_rl.algorithms.motion_bridge import MotionBridgeRetargeter
 from rsl_rl.algorithms.rgmt import RGMT, RGMTActorModel
+from rsl_rl.env import VecEnv
+from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.models import MLPModel
 from rsl_rl.modules import HiddenState
-from rsl_rl.utils import resolve_optimizer, unpad_trajectories
+from rsl_rl.storage import RolloutStorage
+from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer, unpad_trajectories
 
 
 def _as_int(value, default: int) -> int:
@@ -426,6 +430,55 @@ class RGMTMotionBridge(RGMT):
         if hasattr(self.optimizer, "register_step_pre_hook"):
             self.optimizer.register_step_pre_hook(lambda optimizer, args, kwargs: self._set_learning_rate(self.learning_rate))
 
+    @staticmethod
+    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> "RGMTMotionBridge":
+        cfg.setdefault("obs_groups", {})
+        cfg.setdefault("multi_gpu", None)
+
+        alg_class = resolve_callable(cfg["algorithm"].pop("class_name"))
+        actor_class = resolve_callable(cfg["actor"].pop("class_name"))
+        critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
+
+        default_sets = [
+            "actor",
+            "critic",
+            cfg["actor"].get("history_obs_set", "proprio_history"),
+            cfg["actor"].get("action_history_obs_set", "action_history"),
+            cfg["actor"].get("command_obs_set", "command_window"),
+            cfg["actor"].get("smpl_obs_set", "smpl_window"),
+            cfg["actor"].get("command_source_obs_set", "command_source"),
+        ]
+        bridge_target_obs_set = cfg["actor"].get("bridge_target_obs_set", "")
+        if bridge_target_obs_set:
+            default_sets.append(bridge_target_obs_set)
+        if cfg["algorithm"].get("rnd_cfg") is not None:
+            default_sets.append("rnd_state")
+        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
+        cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
+        cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
+
+        actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+        print(f"RGMT Actor Model: {actor}")
+        critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+        print(f"Critic Model: {critic}")
+
+        storage_obs = obs
+        if getattr(actor, "freeze_motion_bridge", False):
+            storage_obs = RGMTMotionBridge._storage_obs_without_frozen_bridge_inputs(obs, actor.smpl_obs_groups)
+        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], storage_obs, [env.num_actions], device)
+        alg = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+        alg.compile(cfg.get("torch_compile_mode"))
+        return alg
+
+    @staticmethod
+    def _storage_obs_without_frozen_bridge_inputs(obs: TensorDict, smpl_obs_groups: list[str]) -> TensorDict:
+        drop_groups = set(smpl_obs_groups)
+        return TensorDict(
+            {key: value for key, value in obs.items() if key not in drop_groups},
+            batch_size=obs.batch_size,
+            device=obs.device,
+        )
+
     def _rebuild_motion_bridge_optimizer(self, optimizer: str, learning_rate: float) -> None:
         all_motion_bridge_params = list(self._raw_actor.motion_bridge.parameters())
         motion_bridge_params = [param for param in all_motion_bridge_params if param.requires_grad]
@@ -467,7 +520,12 @@ class RGMTMotionBridge(RGMT):
         if mixed_command is None:
             return obs
 
-        cached_obs = obs.clone()
+        drop_groups = set(self._raw_actor.smpl_obs_groups)
+        cached_obs = TensorDict(
+            {key: value for key, value in obs.items() if key not in drop_groups},
+            batch_size=obs.batch_size,
+            device=obs.device,
+        )
         flat_command = mixed_command.reshape(mixed_command.shape[0], -1).detach()
         for group in self._raw_actor.command_obs_groups:
             if group in cached_obs.keys():
