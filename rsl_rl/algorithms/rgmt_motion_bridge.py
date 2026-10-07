@@ -57,11 +57,11 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
             raise KeyError(f"RGMTMotionBridgeActorModel requires obs_groups['{smpl_obs_set}'].")
         if command_source_obs_set not in obs_groups:
             raise KeyError(f"RGMTMotionBridgeActorModel requires obs_groups['{command_source_obs_set}'].")
-        if bridge_target_obs_set not in obs_groups:
+        if bridge_target_obs_set and bridge_target_obs_set not in obs_groups:
             raise KeyError(f"RGMTMotionBridgeActorModel requires obs_groups['{bridge_target_obs_set}'].")
         self.smpl_obs_groups = obs_groups[smpl_obs_set]
         self.command_source_obs_groups = obs_groups[command_source_obs_set]
-        self.bridge_target_obs_groups = obs_groups[bridge_target_obs_set]
+        self.bridge_target_obs_groups = obs_groups[bridge_target_obs_set] if bridge_target_obs_set else None
         self.smpl_step_dim = self._infer_step_dim(obs, self.smpl_obs_groups, self.command_window_size)
         self.motion_bridge_dt = float(motion_bridge_dt)
         self._output_dim = output_dim
@@ -208,6 +208,8 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         return target_norm * self.motion_bridge_target_std + self.motion_bridge_target_mean
 
     def motion_bridge_prediction_and_reference(self, obs: TensorDict, prediction=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.bridge_target_obs_groups is None:
+            raise RuntimeError("MotionBridge target observations are not configured.")
         target_window = self._sequence_obs_groups(obs, self.bridge_target_obs_groups, self.command_window_size)
         command_source = self._flatten_obs_groups(obs, self.command_source_obs_groups)
         smpl_mask = (command_source[:, :1] > 0.5).to(target_window.dtype)
@@ -508,12 +510,15 @@ class RGMTMotionBridge(RGMT):
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            cached_bridge_prediction = getattr(self._raw_actor, "_last_bridge_prediction", None)
-            if cached_bridge_prediction is not None:
-                cached_bridge_prediction = cached_bridge_prediction[:original_batch_size]
-            bridge_loss = self._motion_bridge_supervised_loss(
-                batch.observations[:original_batch_size], cached_bridge_prediction
-            )
+            if self.bridge_loss_coef > 0.0:
+                cached_bridge_prediction = getattr(self._raw_actor, "_last_bridge_prediction", None)
+                if cached_bridge_prediction is not None:
+                    cached_bridge_prediction = cached_bridge_prediction[:original_batch_size]
+                bridge_loss = self._motion_bridge_supervised_loss(
+                    batch.observations[:original_batch_size], cached_bridge_prediction
+                )
+            else:
+                bridge_loss = torch.zeros((), device=surrogate_loss.device, dtype=surrogate_loss.dtype)
             loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
