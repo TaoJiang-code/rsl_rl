@@ -65,7 +65,7 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         self.smpl_step_dim = self._infer_step_dim(obs, self.smpl_obs_groups, self.command_window_size)
         self.motion_bridge_dt = float(motion_bridge_dt)
         self._output_dim = output_dim
-        self._last_bridge_prediction: torch.Tensor | None = None
+        self._last_bridge_prediction = None
 
         checkpoint_path = Path(motion_bridge_checkpoint).expanduser()
         if not checkpoint_path.is_file():
@@ -207,9 +207,7 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         target_norm = self.motion_bridge(smpl_norm)
         return target_norm * self.motion_bridge_target_std + self.motion_bridge_target_mean
 
-    def motion_bridge_prediction_and_reference(
-        self, obs: TensorDict, prediction: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def motion_bridge_prediction_and_reference(self, obs: TensorDict, prediction=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         target_window = self._sequence_obs_groups(obs, self.bridge_target_obs_groups, self.command_window_size)
         command_source = self._flatten_obs_groups(obs, self.command_source_obs_groups)
         smpl_mask = (command_source[:, :1] > 0.5).to(target_window.dtype)
@@ -581,9 +579,7 @@ class RGMTMotionBridge(RGMT):
         self.storage.clear()
         return loss_dict
 
-    def _motion_bridge_supervised_loss(
-        self, observations: TensorDict, prediction: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def _motion_bridge_supervised_loss(self, observations: TensorDict, prediction=None) -> torch.Tensor:
         prediction, reference, smpl_mask = self._raw_actor.motion_bridge_prediction_and_reference(observations, prediction)
         sample_loss = torch.abs(prediction - reference).mean(dim=tuple(range(1, prediction.ndim)))
         sample_mask = smpl_mask.reshape(-1).to(sample_loss.dtype)
