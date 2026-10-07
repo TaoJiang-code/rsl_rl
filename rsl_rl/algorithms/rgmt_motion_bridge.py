@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from tensordict import TensorDict
 
 from rsl_rl.algorithms.motion_bridge import MotionBridgeRetargeter
@@ -23,15 +22,14 @@ def _as_int(value, default: int) -> int:
 
 
 class RGMTMotionBridgeActorModel(RGMTActorModel):
-    """RGMT actor with a trainable SMPL -> command frontend.
+    """RGMT actor with a trainable SMPL-X -> RGMT-command frontend.
 
     The environment provides both the ordinary RGMT reference command window and a
     paired SMPL/human-motion window. A per-env command-source flag chooses the
     active path:
 
     - reference path: use the reference command window directly;
-    - SMPL path: run MotionBridge, adapt its robot-motion target into RGMT
-      command tokens, then use those tokens.
+    - SMPL path: run MotionBridge and use its RGMT command tokens directly.
 
     The actor outputs final joint-position targets. Internally it still predicts
     an RGMT residual, but adds it to the selected base motion before updating the
@@ -51,7 +49,6 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         motion_bridge_checkpoint: str = "logs/motion_bridge/model_250.pt",
         motion_bridge_dt: float = 0.02,
         freeze_motion_bridge: bool = False,
-        bridge_command_hidden_dim: int | None = None,
         **kwargs,
     ) -> None:
         super().__init__(obs, obs_groups, obs_set, output_dim, **kwargs)
@@ -68,6 +65,7 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         self.smpl_step_dim = self._infer_step_dim(obs, self.smpl_obs_groups, self.command_window_size)
         self.motion_bridge_dt = float(motion_bridge_dt)
         self._output_dim = output_dim
+        self._last_bridge_prediction: torch.Tensor | None = None
 
         checkpoint_path = Path(motion_bridge_checkpoint).expanduser()
         if not checkpoint_path.is_file():
@@ -76,6 +74,12 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         input_dim = int(checkpoint.get("input_dim", self.smpl_step_dim))
         target_dim = int(checkpoint["target_dim"])
         self.motion_bridge_target_dim = target_dim
+        if target_dim != self.command_step_dim:
+            raise ValueError(
+                f"MotionBridge checkpoint target_dim={target_dim}, but RGMT command step dim is "
+                f"{self.command_step_dim}. The current MotionBridge must output [lin_vel_b, ang_vel_b, gravity_b, q_ref] "
+                "directly."
+            )
         if input_dim != self.smpl_step_dim:
             raise ValueError(
                 f"MotionBridge checkpoint expects input_dim={input_dim}, but smpl_window step dim is {self.smpl_step_dim}."
@@ -85,7 +89,7 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
             input_dim=input_dim,
             output_dim=target_dim,
             hidden_dim=_as_int(args.get("hidden_dim"), 512),
-            num_conv_blocks=_as_int(args.get("num_conv_blocks"), 4),
+            num_conv_blocks=_as_int(args.get("num_conv_blocks"), 3),
             num_transformer_layers=_as_int(args.get("num_transformer_layers"), 6),
             num_attention_heads=_as_int(args.get("num_attention_heads"), 8),
             feedforward_dim=_as_int(args.get("feedforward_dim"), 2048),
@@ -112,13 +116,6 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
             "motion_bridge_target_std",
             torch.as_tensor(np.asarray(normalization["target_std"], dtype=np.float32)),
             persistent=True,
-        )
-
-        hidden_dim = int(bridge_command_hidden_dim or self.command_step_dim)
-        self.bridge_command_adapter = nn.Sequential(
-            nn.Linear(self.motion_bridge_target_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, self.command_step_dim),
         )
 
         if freeze_motion_bridge:
@@ -187,7 +184,8 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         reference_command = self._sequence_obs_groups(obs, self.command_obs_groups, self.command_window_size)
         smpl_window = self._sequence_obs_groups(obs, self.smpl_obs_groups, self.command_window_size)
         bridge_target = self._motion_bridge_target(smpl_window)
-        bridge_command = self.bridge_command_adapter(bridge_target)
+        self._last_bridge_prediction = bridge_target
+        bridge_command = bridge_target
 
         command_source = self._flatten_obs_groups(obs, self.command_source_obs_groups)
         smpl_mask = (command_source[:, :1] > 0.5).to(reference_command.dtype).reshape(-1, 1, 1)
@@ -207,72 +205,19 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         target_norm = self.motion_bridge(smpl_norm)
         return target_norm * self.motion_bridge_target_std + self.motion_bridge_target_mean
 
-    def motion_bridge_prediction_and_reference(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def motion_bridge_prediction_and_reference(
+        self, obs: TensorDict, prediction: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         smpl_window = self._sequence_obs_groups(obs, self.smpl_obs_groups, self.command_window_size)
         target_window = self._sequence_obs_groups(obs, self.bridge_target_obs_groups, self.command_window_size)
         command_source = self._flatten_obs_groups(obs, self.command_source_obs_groups)
         smpl_mask = (command_source[:, :1] > 0.5).to(smpl_window.dtype)
-        return self._motion_bridge_target(smpl_window), target_window, smpl_mask
+        if prediction is None or prediction.shape[:2] != target_window.shape[:2]:
+            prediction = self._motion_bridge_target(smpl_window)
+        return prediction, target_window, smpl_mask
 
     def _paper_target_joint_pos(self, target: torch.Tensor) -> torch.Tensor:
         return target[..., -self._output_dim :]
-
-    def _paper_target_to_rgmt_command(self, target: torch.Tensor) -> torch.Tensor:
-        target_dim = target.shape[-1]
-        no_height_body_dims = target_dim - 2 - 6 - self._output_dim
-        with_height_body_dims = target_dim - 2 - 1 - 6 - self._output_dim
-        if no_height_body_dims >= 0 and no_height_body_dims % 6 == 0:
-            rotation_start = 2
-        elif with_height_body_dims >= 0 and with_height_body_dims % 6 == 0:
-            rotation_start = 3
-        else:
-            raise ValueError(
-                f"Cannot parse MotionBridge target_dim={target_dim} for output_dim={self._output_dim}."
-            )
-
-        root_vel_xy = target[..., 0:2]
-        root_rot6d = target[..., rotation_start : rotation_start + 6]
-        joint_pos = target[..., -self._output_dim :]
-        root_rot = self._rot6d_to_matrix(root_rot6d)
-
-        root_lin_vel_w = torch.zeros(*root_vel_xy.shape[:-1], 3, device=target.device, dtype=target.dtype)
-        root_lin_vel_w[..., 0:2] = root_vel_xy
-        ref_lin_vel_b = torch.matmul(root_rot.transpose(-1, -2), root_lin_vel_w.unsqueeze(-1)).squeeze(-1)
-        ref_ang_vel_b = self._body_angular_velocity_from_rotation(root_rot, self.motion_bridge_dt)
-
-        gravity_w = torch.zeros_like(root_lin_vel_w)
-        gravity_w[..., 2] = -1.0
-        ref_projected_gravity_b = torch.matmul(root_rot.transpose(-1, -2), gravity_w.unsqueeze(-1)).squeeze(-1)
-        return torch.cat((ref_lin_vel_b, ref_ang_vel_b, ref_projected_gravity_b, joint_pos), dim=-1)
-
-    @staticmethod
-    def _rot6d_to_matrix(rot6d: torch.Tensor) -> torch.Tensor:
-        columns = rot6d.reshape(*rot6d.shape[:-1], 3, 2)
-        a1 = columns[..., :, 0]
-        a2 = columns[..., :, 1]
-        b1 = F.normalize(a1, dim=-1)
-        b2 = F.normalize(a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1, dim=-1)
-        b3 = torch.cross(b1, b2, dim=-1)
-        return torch.stack((b1, b2, b3), dim=-1)
-
-    @staticmethod
-    def _body_angular_velocity_from_rotation(rotation: torch.Tensor, dt: float) -> torch.Tensor:
-        if rotation.shape[1] == 1:
-            return torch.zeros(*rotation.shape[:2], 3, device=rotation.device, dtype=rotation.dtype)
-        rotation_dot = torch.zeros_like(rotation)
-        rotation_dot[:, 0] = (rotation[:, 1] - rotation[:, 0]) / dt
-        rotation_dot[:, -1] = (rotation[:, -1] - rotation[:, -2]) / dt
-        if rotation.shape[1] > 2:
-            rotation_dot[:, 1:-1] = (rotation[:, 2:] - rotation[:, :-2]) / (2.0 * dt)
-        omega_hat_b = torch.matmul(rotation.transpose(-1, -2), rotation_dot)
-        return torch.stack(
-            (
-                omega_hat_b[..., 2, 1],
-                omega_hat_b[..., 0, 2],
-                omega_hat_b[..., 1, 0],
-            ),
-            dim=-1,
-        )
 
     def as_jit(self) -> nn.Module:
         return _TorchRGMTMotionBridgeActorModel(self)
@@ -320,7 +265,6 @@ class _TorchRGMTMotionBridgeActorModel(nn.Module):
         self.command_quantizer = copy.deepcopy(model.command_quantizer)
         self.mlp = copy.deepcopy(model.mlp)
         self.motion_bridge = copy.deepcopy(model.motion_bridge)
-        self.bridge_command_adapter = copy.deepcopy(model.bridge_command_adapter)
 
         self.register_buffer("motion_bridge_input_mean", model.motion_bridge_input_mean.detach().clone(), persistent=True)
         self.register_buffer("motion_bridge_input_std", model.motion_bridge_input_std.detach().clone(), persistent=True)
@@ -377,7 +321,7 @@ class _TorchRGMTMotionBridgeActorModel(nn.Module):
         command_source: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bridge_target = self._motion_bridge_target(smpl_window)
-        bridge_command = self.bridge_command_adapter(bridge_target)
+        bridge_command = bridge_target
 
         smpl_mask = (command_source[:, :1] > 0.5).to(reference_command.dtype).reshape(-1, 1, 1)
         command = reference_command * (1.0 - smpl_mask) + bridge_command * smpl_mask
@@ -395,61 +339,6 @@ class _TorchRGMTMotionBridgeActorModel(nn.Module):
 
     def _paper_target_joint_pos(self, target: torch.Tensor) -> torch.Tensor:
         return target[..., -self.output_dim :]
-
-    def _paper_target_to_rgmt_command(self, target: torch.Tensor) -> torch.Tensor:
-        target_dim = target.shape[-1]
-        no_height_body_dims = target_dim - 2 - 6 - self.output_dim
-        with_height_body_dims = target_dim - 2 - 1 - 6 - self.output_dim
-        if no_height_body_dims >= 0 and no_height_body_dims % 6 == 0:
-            rotation_start = 2
-        elif with_height_body_dims >= 0 and with_height_body_dims % 6 == 0:
-            rotation_start = 3
-        else:
-            raise RuntimeError("Cannot parse MotionBridge target dimension.")
-
-        root_vel_xy = target[..., 0:2]
-        root_rot6d = target[..., rotation_start : rotation_start + 6]
-        joint_pos = target[..., -self.output_dim :]
-        root_rot = self._rot6d_to_matrix(root_rot6d)
-
-        root_lin_vel_w = torch.zeros(target.shape[0], target.shape[1], 3, device=target.device, dtype=target.dtype)
-        root_lin_vel_w[..., 0:2] = root_vel_xy
-        ref_lin_vel_b = torch.matmul(root_rot.transpose(-1, -2), root_lin_vel_w.unsqueeze(-1)).squeeze(-1)
-        ref_ang_vel_b = self._body_angular_velocity_from_rotation(root_rot, self.motion_bridge_dt)
-
-        gravity_w = torch.zeros_like(root_lin_vel_w)
-        gravity_w[..., 2] = -1.0
-        ref_projected_gravity_b = torch.matmul(root_rot.transpose(-1, -2), gravity_w.unsqueeze(-1)).squeeze(-1)
-        return torch.cat((ref_lin_vel_b, ref_ang_vel_b, ref_projected_gravity_b, joint_pos), dim=-1)
-
-    @staticmethod
-    def _rot6d_to_matrix(rot6d: torch.Tensor) -> torch.Tensor:
-        columns = rot6d.reshape(rot6d.shape[0], rot6d.shape[1], 3, 2)
-        a1 = columns[..., :, 0]
-        a2 = columns[..., :, 1]
-        b1 = F.normalize(a1, dim=-1)
-        b2 = F.normalize(a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1, dim=-1)
-        b3 = torch.cross(b1, b2, dim=-1)
-        return torch.stack((b1, b2, b3), dim=-1)
-
-    @staticmethod
-    def _body_angular_velocity_from_rotation(rotation: torch.Tensor, dt: float) -> torch.Tensor:
-        if rotation.shape[1] == 1:
-            return torch.zeros(rotation.shape[0], rotation.shape[1], 3, device=rotation.device, dtype=rotation.dtype)
-        rotation_dot = torch.zeros_like(rotation)
-        rotation_dot[:, 0] = (rotation[:, 1] - rotation[:, 0]) / dt
-        rotation_dot[:, -1] = (rotation[:, -1] - rotation[:, -2]) / dt
-        if rotation.shape[1] > 2:
-            rotation_dot[:, 1:-1] = (rotation[:, 2:] - rotation[:, :-2]) / (2.0 * dt)
-        omega_hat_b = torch.matmul(rotation.transpose(-1, -2), rotation_dot)
-        return torch.stack(
-            (
-                omega_hat_b[..., 2, 1],
-                omega_hat_b[..., 0, 2],
-                omega_hat_b[..., 1, 0],
-            ),
-            dim=-1,
-        )
 
     @torch.jit.export
     def reset(self) -> None:
@@ -619,7 +508,12 @@ class RGMTMotionBridge(RGMT):
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            bridge_loss = self._motion_bridge_supervised_loss(batch.observations[:original_batch_size])
+            cached_bridge_prediction = getattr(self._raw_actor, "_last_bridge_prediction", None)
+            if cached_bridge_prediction is not None:
+                cached_bridge_prediction = cached_bridge_prediction[:original_batch_size]
+            bridge_loss = self._motion_bridge_supervised_loss(
+                batch.observations[:original_batch_size], cached_bridge_prediction
+            )
             loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
@@ -681,10 +575,14 @@ class RGMTMotionBridge(RGMT):
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
         loss_dict["motion_bridge_learning_rate"] = self.learning_rate * self.motion_bridge_lr_scale
+
+        self.storage.clear()
         return loss_dict
 
-    def _motion_bridge_supervised_loss(self, observations: TensorDict) -> torch.Tensor:
-        prediction, reference, smpl_mask = self._raw_actor.motion_bridge_prediction_and_reference(observations)
+    def _motion_bridge_supervised_loss(
+        self, observations: TensorDict, prediction: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        prediction, reference, smpl_mask = self._raw_actor.motion_bridge_prediction_and_reference(observations, prediction)
         sample_loss = torch.abs(prediction - reference).mean(dim=tuple(range(1, prediction.ndim)))
         sample_mask = smpl_mask.reshape(-1).to(sample_loss.dtype)
         if torch.sum(sample_mask) <= 0.0:
