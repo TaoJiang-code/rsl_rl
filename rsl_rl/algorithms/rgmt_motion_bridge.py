@@ -66,6 +66,8 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
         self.motion_bridge_dt = float(motion_bridge_dt)
         self._output_dim = output_dim
         self._last_bridge_prediction = None
+        self._last_mixed_command = None
+        self._last_mixed_command_source = None
         self.freeze_motion_bridge = bool(freeze_motion_bridge)
 
         checkpoint_path = Path(motion_bridge_checkpoint).expanduser()
@@ -202,6 +204,8 @@ class RGMTMotionBridgeActorModel(RGMTActorModel):
             base_joint_pos[smpl_rows] = self._paper_target_joint_pos(bridge_target)[:, center_id]
 
         self._last_bridge_prediction = bridge_prediction
+        self._last_mixed_command = command
+        self._last_mixed_command_source = torch.zeros_like(command_source)
         return command, base_joint_pos
 
     def _motion_bridge_target(self, smpl_window: torch.Tensor) -> torch.Tensor:
@@ -450,6 +454,33 @@ class RGMTMotionBridge(RGMT):
                 param_group["lr"] = learning_rate * self.motion_bridge_lr_scale
             else:
                 param_group["lr"] = learning_rate
+
+    def act(self, obs: TensorDict) -> torch.Tensor:
+        actions = super().act(obs)
+        if getattr(self._raw_actor, "freeze_motion_bridge", False):
+            self.transition.observations = self._observations_with_cached_bridge_command(self.transition.observations)
+        return actions
+
+    def _observations_with_cached_bridge_command(self, obs: TensorDict) -> TensorDict:
+        mixed_command = getattr(self._raw_actor, "_last_mixed_command", None)
+        mixed_command_source = getattr(self._raw_actor, "_last_mixed_command_source", None)
+        if mixed_command is None:
+            return obs
+
+        cached_obs = obs.clone()
+        flat_command = mixed_command.reshape(mixed_command.shape[0], -1).detach()
+        for group in self._raw_actor.command_obs_groups:
+            if group in cached_obs.keys():
+                cached_obs[group] = flat_command.reshape_as(cached_obs[group])
+                break
+
+        if mixed_command_source is not None:
+            flat_source = mixed_command_source.detach()
+            for group in self._raw_actor.command_source_obs_groups:
+                if group in cached_obs.keys():
+                    cached_obs[group] = flat_source.reshape_as(cached_obs[group])
+                    break
+        return cached_obs
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
