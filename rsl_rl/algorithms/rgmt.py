@@ -157,6 +157,8 @@ class RGMTActorModel(nn.Module):
         command_obs_set: str = "command_window",
         history_length: int = 10,
         command_window_size: int = 11,
+        command_step_dim: int | None = None,
+        command_schema: str = "[v_ref(3), w_ref(3), g_ref(3), q_ref(action_dim)]",
         embedding_dim: int = 128,
         history_hidden_dims: tuple[int, ...] | list[int] = (256, 256),
         state_hidden_dims: tuple[int, ...] | list[int] | None = None,
@@ -180,6 +182,8 @@ class RGMTActorModel(nn.Module):
         self.history_length = history_length
         self.command_window_size = command_window_size
         self.embedding_dim = embedding_dim
+        self.expected_command_step_dim = command_step_dim
+        self.command_schema = command_schema
 
         self.obs_dim = self._sum_flat_obs_dim(obs, self.obs_groups)
         self.state_step_dim = self._infer_step_dim(obs, self.state_history_obs_groups, history_length)
@@ -264,11 +268,11 @@ class RGMTActorModel(nn.Module):
                 f"{output_dim}, got {self.action_step_dim}. Configured groups: {self.action_history_obs_groups}."
             )
 
-        expected_command_step_dim = 9 + output_dim
+        expected_command_step_dim = self.expected_command_step_dim if self.expected_command_step_dim is not None else 9 + output_dim
         if self.command_step_dim != expected_command_step_dim:
             raise ValueError(
                 "RGMT command window schema mismatch. Expected each command token to be "
-                f"[v_ref(3), w_ref(3), g_ref(3), q_ref({output_dim})] with dim "
+                f"{self.command_schema} with dim "
                 f"{expected_command_step_dim}, got {self.command_step_dim}. "
                 f"Configured groups: {self.command_obs_groups}."
             )
