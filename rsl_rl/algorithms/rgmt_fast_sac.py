@@ -349,7 +349,9 @@ class RGMTFastSACActorModel(RGMTActorModel):
 
     @property
     def output_std(self) -> torch.Tensor:
-        return self.log_std_mlp[-1].weight.new_zeros(self.action_dim)
+        log_std = self.log_std_mlp[-1].weight.new_zeros(self.action_dim)
+        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (torch.tanh(log_std) + 1.0)
+        return log_std.exp()
 
     def _init_sac_heads(self) -> None:
         for module in (self.mlp[-1], self.log_std_mlp[-1]):
