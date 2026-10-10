@@ -426,6 +426,11 @@ class RGMTActorModel(nn.Module):
         for group in groups:
             value = obs[group]
             if len(value.shape) == 3:
+                if value.shape[1] != sequence_length:
+                    raise ValueError(
+                        f"Observation '{group}' with shape {value.shape} does not match sequence length "
+                        f"{sequence_length}. Check the observation group history settings."
+                    )
                 sequences.append(value)
             else:
                 sequences.append(value.reshape(batch_size, sequence_length, -1))

@@ -477,7 +477,7 @@ class RGMTFastSAC(FastSAC):
         target_critic = copy.deepcopy(critic)
 
         gamma = cfg["algorithm"].get("gamma", 0.99)
-        cfg["algorithm"].pop("rnd_cfg", None)
+        rnd_cfg = cfg["algorithm"].pop("rnd_cfg", None)
         actor_obs = actor.get_observation(obs.to(device))
         replay_buffer = RGMTSACReplayBuffer(
             num_envs=env.num_envs,
@@ -498,5 +498,6 @@ class RGMTFastSAC(FastSAC):
             multi_gpu_cfg=cfg["multi_gpu"],
             **cfg["algorithm"],
         )
+        cfg["algorithm"]["rnd_cfg"] = rnd_cfg
         alg.compile(cfg.get("torch_compile_mode"))
         return alg
