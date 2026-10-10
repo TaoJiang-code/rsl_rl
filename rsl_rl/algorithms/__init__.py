@@ -13,6 +13,7 @@ from .fast_sac import FastSAC, FastSACActorModel, FastSACCriticModel
 from .parkour_ppo import ParkourPPO
 from .ppo import PPO
 from .rgmt import RGMT, RGMTActorModel
+from .rgmt_fast_sac import RGMTFastSAC, RGMTFastSACActorModel
 from .rgmt_stage2 import RGMTStageII
 from .motion_bridge import MotionBridgeRetargeter
 from .sonic_lora_ppo import LoRALinear, SonicActorModel, SonicCriticModel, SonicLoRAPPO
@@ -31,6 +32,8 @@ __all__ = [
     "PPO",
     "RGMT",
     "RGMTActorModel",
+    "RGMTFastSAC",
+    "RGMTFastSACActorModel",
     "RGMTStageII",
     "MotionBridgeRetargeter",
     "SonicLoRAPPO",
