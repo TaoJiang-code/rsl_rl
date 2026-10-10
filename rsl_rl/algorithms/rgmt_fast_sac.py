@@ -477,6 +477,7 @@ class RGMTFastSAC(FastSAC):
         target_critic = copy.deepcopy(critic)
 
         gamma = cfg["algorithm"].get("gamma", 0.99)
+        cfg["algorithm"].pop("rnd_cfg", None)
         actor_obs = actor.get_observation(obs.to(device))
         replay_buffer = RGMTSACReplayBuffer(
             num_envs=env.num_envs,
