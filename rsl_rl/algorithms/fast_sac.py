@@ -19,7 +19,7 @@ from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, re
 
 
 def _concat_obs(obs: TensorDict, obs_groups: list[str]) -> torch.Tensor:
-    return torch.cat([obs[group] for obs_group in obs_groups], dim=-1)
+    return torch.cat([obs[obs_group] for obs_group in obs_groups], dim=-1)
 
 
 def _make_holosoma_mlp(input_dim: int, hidden_dim: int, use_layer_norm: bool) -> nn.Sequential:
