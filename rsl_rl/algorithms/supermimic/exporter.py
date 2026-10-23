@@ -36,7 +36,7 @@ def export_supermimic_policy(
     """Export a SuperMimic policy with dynamic batch size and explicit history/goal inputs."""
     export_dir = Path(path)
     export_dir.mkdir(parents=True, exist_ok=True)
-    model = _SuperMimicExportPolicy(policy)
+    model = _SuperMimicExportPolicy(policy).eval()
     goal_dim = GOAL_STEP_DIM * goal_frames
     example_history = torch.zeros(1, history_length, OBS_DIM)
     example_goal = torch.zeros(1, goal_dim)
@@ -44,6 +44,7 @@ def export_supermimic_policy(
     jit_path = export_dir / jit_filename
     with torch.inference_mode():
         traced = torch.jit.trace(model, (example_history, example_goal), strict=True)
+        traced.eval()
         traced = torch.jit.freeze(traced)
         torch.testing.assert_close(
             traced(example_history, example_goal),
