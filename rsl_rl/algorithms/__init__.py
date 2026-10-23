@@ -17,6 +17,7 @@ from .rgmt_fast_sac import RGMTFastSAC, RGMTFastSACActorModel
 from .rgmt_stage2 import RGMTStageII
 from .motion_bridge import MotionBridgeRetargeter
 from .sonic_lora_ppo import LoRALinear, SonicActorModel, SonicCriticModel, SonicLoRAPPO
+from .supermimic import SuperMimicAlgorithm
 
 __all__ = [
     "AMPPPO",
@@ -41,4 +42,5 @@ __all__ = [
     "SonicCriticModel",
     "LoRALinear",
     "Distillation",
+    "SuperMimicAlgorithm",
 ]

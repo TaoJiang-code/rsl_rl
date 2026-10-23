@@ -15,6 +15,7 @@ from .parkour_on_policy_runner import ParkourOnPolicyRunner
 from .rgmt_runner import RGMTRunner
 from .rgmt_stage2_runner import RGMTStageIIRunner
 from .sonic_lora_runner import SonicLoRARunner
+from .supermimic_runner import SuperMimicRunner
 
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "RGMTRunner",
     "RGMTStageIIRunner",
     "SonicLoRARunner",
+    "SuperMimicRunner",
 ]
