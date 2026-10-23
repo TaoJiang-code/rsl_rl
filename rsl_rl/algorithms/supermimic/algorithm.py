@@ -9,10 +9,6 @@ import torch.nn as nn
 
 from .buffer import ReplayBuffer
 from .mdp import (
-    CRITIC_EXTRA_DIM,
-    GOAL_STEP_DIM,
-    INV_DIM,
-    OBS_DIM,
     SuperMimicMDP,
     normalize_context,
     unflatten_state,
@@ -25,6 +21,7 @@ class SuperMimicAlgorithm:
     def __init__(self, mdp: SuperMimicMDP, num_envs: int, cfg: dict, device: str):
         self.mdp = mdp
         self.motion = mdp.motion
+        self.robot_spec = mdp.robot_spec
         self.cfg = cfg
         self.device = device
         self.goal_frames = int(cfg["goal_frames"])
@@ -32,27 +29,32 @@ class SuperMimicAlgorithm:
         self.horizon = int(cfg["imagination_horizon"])
         self.world_model_window = int(cfg["world_model_window"])
         self.base_learning_rate = float(cfg["learning_rate"])
-        goal_dim = GOAL_STEP_DIM * self.goal_frames
-        critic_dim = INV_DIM + CRITIC_EXTRA_DIM + goal_dim
+        goal_dim = self.robot_spec.goal_dim(self.goal_frames)
+        critic_dim = self.robot_spec.invariant_dim + self.robot_spec.critic_extra_dim + goal_dim
 
         networks.AMP_DTYPE = torch.bfloat16 if cfg.get("amp", "bf16") == "bf16" else None
-        self.world_model = WorldModel().to(device)
-        self.policy = Policy(OBS_DIM, goal_dim, self.history_length).to(device)
+        self.world_model = WorldModel(self.robot_spec).to(device)
+        self.policy = Policy(
+            self.robot_spec.observation_dim,
+            goal_dim,
+            self.robot_spec.num_joints,
+            self.history_length,
+        ).to(device)
         self.critic = Critic(critic_dim).to(device)
         self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=self.base_learning_rate)
         self.policy_optimizer = torch.optim.Adam(
             self.policy.parameters(), lr=self.base_learning_rate, betas=(0.9, 0.95)
         )
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.base_learning_rate)
-        self.replay = ReplayBuffer(int(cfg["replay_steps"]), num_envs, device)
+        self.replay = ReplayBuffer(int(cfg["replay_steps"]), num_envs, device, self.robot_spec)
         self.error_floor = torch.cat(
             (
                 torch.full((3,), 3e-3),
                 torch.full((3,), 5e-3),
                 torch.full((3,), 2e-2),
                 torch.full((3,), 5e-2),
-                torch.full((29,), 3e-3),
-                torch.full((29,), 5e-2),
+                torch.full((self.robot_spec.num_joints,), 3e-3),
+                torch.full((self.robot_spec.num_joints,), 5e-2),
             )
         ).to(device)
         self.world_model_rollout = self._world_model_rollout
@@ -280,6 +282,7 @@ class SuperMimicAlgorithm:
 
     def state_dict(self) -> dict:
         return {
+            "robot_spec": self.robot_spec.to_dict(),
             "world_model": self.world_model.state_dict(),
             "policy": self.policy.state_dict(),
             "critic": self.critic.state_dict(),
@@ -289,6 +292,11 @@ class SuperMimicAlgorithm:
         }
 
     def load_state_dict(self, state: dict, load_optimizers: bool = True) -> None:
+        saved_spec = state.get("robot_spec")
+        if saved_spec is not None and saved_spec != self.robot_spec.to_dict():
+            raise ValueError(
+                f"Checkpoint robot spec {saved_spec} does not match environment {self.robot_spec.to_dict()}."
+            )
         self.world_model.load_state_dict(state["world_model"])
         self.policy.load_state_dict(state["policy"])
         self.critic.load_state_dict(state["critic"])

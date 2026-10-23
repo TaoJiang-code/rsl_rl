@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from .mdp import GOAL_STEP_DIM, OBS_DIM
+from .mdp import SuperMimicRobotSpec
 
 
 class _SuperMimicExportPolicy(nn.Module):
@@ -28,6 +28,7 @@ class _SuperMimicExportPolicy(nn.Module):
 def export_supermimic_policy(
     policy: nn.Module,
     path: str | Path,
+    robot_spec: SuperMimicRobotSpec,
     history_length: int,
     goal_frames: int,
     jit_filename: str = "policy.pt",
@@ -36,9 +37,17 @@ def export_supermimic_policy(
     """Export a SuperMimic policy with dynamic batch size and explicit history/goal inputs."""
     export_dir = Path(path)
     export_dir.mkdir(parents=True, exist_ok=True)
+    expected = (
+        robot_spec.observation_dim,
+        robot_spec.goal_dim(goal_frames),
+        robot_spec.num_joints,
+    )
+    actual = (policy.obs_dim, policy.goal_dim, policy.action_dim)
+    if actual != expected:
+        raise ValueError(f"Policy dimensions {actual} do not match robot spec dimensions {expected}.")
     model = _SuperMimicExportPolicy(policy).eval()
-    goal_dim = GOAL_STEP_DIM * goal_frames
-    example_history = torch.zeros(1, history_length, OBS_DIM)
+    goal_dim = robot_spec.goal_dim(goal_frames)
+    example_history = torch.zeros(1, history_length, robot_spec.observation_dim)
     example_goal = torch.zeros(1, goal_dim)
 
     jit_path = export_dir / jit_filename
@@ -73,16 +82,16 @@ def export_supermimic_policy(
     metadata = {
         "format_version": 1,
         "inputs": {
-            "observation_history": ["batch", history_length, OBS_DIM],
+            "observation_history": ["batch", history_length, robot_spec.observation_dim],
             "goal": ["batch", goal_dim],
         },
-        "outputs": {"action": ["batch", 29]},
+        "outputs": {"action": ["batch", robot_spec.num_joints]},
         "observation_layout": [
-            "joint_position_relative:29",
-            "joint_velocity:29",
+            f"joint_position_relative:{robot_spec.num_joints}",
+            f"joint_velocity:{robot_spec.num_joints}",
             "base_angular_velocity:3",
             "projected_gravity:3",
-            "previous_action:29",
+            f"previous_action:{robot_spec.num_joints}",
             "relative_reference_root_orientation_6d:6",
         ],
         "goal_frame_layout": [
@@ -90,10 +99,11 @@ def export_supermimic_policy(
             "root_orientation_heading_local_6d:6",
             "root_linear_velocity_local:3",
             "root_angular_velocity_local:3",
-            "joint_position:29",
-            "joint_velocity_scaled_0.1:29",
+            f"joint_position:{robot_spec.num_joints}",
+            f"joint_velocity_scaled_0.1:{robot_spec.num_joints}",
         ],
         "goal_frames": goal_frames,
+        "robot_spec": robot_spec.to_dict(),
     }
     (export_dir / "policy_io.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return jit_path, onnx_path

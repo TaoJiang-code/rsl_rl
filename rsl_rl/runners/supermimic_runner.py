@@ -11,7 +11,11 @@ import torch
 
 from rsl_rl.algorithms.supermimic.algorithm import SuperMimicAlgorithm
 from rsl_rl.algorithms.supermimic.kinematics import UrdfKinematics
-from rsl_rl.algorithms.supermimic.mdp import SuperMimicMDP, flatten_state, unflatten_state
+from rsl_rl.algorithms.supermimic.mdp import (
+    SuperMimicMDP,
+    SuperMimicRobotSpec,
+    unflatten_state,
+)
 
 
 class SuperMimicRunner:
@@ -34,6 +38,15 @@ class SuperMimicRunner:
 
         self.motion = self.unwrapped.command_manager.get_term("motion")
         self.action_term = self.unwrapped.action_manager.get_term("joint_pos")
+        self.robot_spec = SuperMimicRobotSpec(
+            num_joints=len(self.motion.cfg.joint_names),
+            num_tracked_bodies=len(self.motion.cfg.tracked_body_names),
+        )
+        if self.action_term.action_dim != self.robot_spec.num_joints:
+            raise ValueError(
+                f"SuperMimic action dimension {self.action_term.action_dim} does not match "
+                f"the {self.robot_spec.num_joints}-joint robot spec."
+            )
         robot = self.unwrapped.scene["robot"]
         urdf_path = Path(self.algorithm_cfg["urdf_path"])
         if not urdf_path.is_absolute():
@@ -47,14 +60,21 @@ class SuperMimicRunner:
         )
         default_joint_position = robot.data.default_joint_pos[0].to(device)
         soft_limits = robot.data.soft_joint_pos_limits[0].to(device)
-        self.mdp = SuperMimicMDP(kinematics, self.motion, default_joint_position, soft_limits)
+        self.mdp = SuperMimicMDP(
+            kinematics,
+            self.motion,
+            default_joint_position,
+            soft_limits,
+            self.robot_spec,
+        )
         self.algorithm = SuperMimicAlgorithm(self.mdp, env.num_envs, self.algorithm_cfg, device)
         self.observation_history = torch.zeros(
             env.num_envs,
             int(self.algorithm_cfg["history_length"]),
-            99,
+            self.robot_spec.observation_dim,
             device=device,
         )
+        print(f"[INFO] SuperMimic robot spec: {self.robot_spec.to_dict()}")
         self.writer = None
         self._csv_file = None
         self._csv_writer = None

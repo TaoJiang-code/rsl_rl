@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .mdp import INV_DIM, NUM_JOINTS, STATE_INCREMENT_DIM, XI_DIM, invariant_features
+from .mdp import SuperMimicRobotSpec, invariant_features
 from .rotations import so3_exp, so3_log, yaw_mat
 
 AMP_DTYPE: torch.dtype | None = None
@@ -62,14 +62,21 @@ class RunningNorm(nn.Module):
 
 
 class WorldModel(nn.Module):
-    def __init__(self, xi_dim: int = XI_DIM):
+    def __init__(self, robot_spec: SuperMimicRobotSpec):
         super().__init__()
-        self.input_dim = INV_DIM + NUM_JOINTS + xi_dim
-        self.net = mlp(self.input_dim, [2048, 2048, 2048], STATE_INCREMENT_DIM, nn.SiLU, True)
+        self.num_joints = robot_spec.num_joints
+        self.input_dim = robot_spec.invariant_dim + self.num_joints + robot_spec.context_dim
+        self.net = mlp(
+            self.input_dim,
+            [2048, 2048, 2048],
+            robot_spec.state_increment_dim,
+            nn.SiLU,
+            True,
+        )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         self.in_norm = RunningNorm(self.input_dim)
-        self.out_norm = RunningNorm(STATE_INCREMENT_DIM, eps=1e-4)
+        self.out_norm = RunningNorm(robot_spec.state_increment_dim, eps=1e-4)
 
     def inputs(self, state, action, normalized_context):
         return torch.cat((invariant_features(state), action, normalized_context), -1)
@@ -96,7 +103,9 @@ class WorldModel(nn.Module):
         p, rotation, v, w, q, qd = state
         output = run_mlp(self.net, self.in_norm(self.inputs(state, action, normalized_context)))
         delta = output * self.out_norm.std() + self.out_norm.mean
-        dp, dtheta, dv, dw, dq, dqd = delta.split((3, 3, 3, 3, NUM_JOINTS, NUM_JOINTS), -1)
+        dp, dtheta, dv, dw, dq, dqd = delta.split(
+            (3, 3, 3, 3, self.num_joints, self.num_joints), -1
+        )
         heading = yaw_mat(rotation)
         return (
             p + (heading @ dp.unsqueeze(-1)).squeeze(-1),
@@ -127,11 +136,21 @@ class WorldModel(nn.Module):
 
 
 class Policy(nn.Module):
-    def __init__(self, obs_dim: int, goal_dim: int, history_length: int = 10, latent_dim: int = 32):
+    def __init__(
+        self,
+        obs_dim: int,
+        goal_dim: int,
+        action_dim: int,
+        history_length: int = 10,
+        latent_dim: int = 32,
+    ):
         super().__init__()
+        self.obs_dim = obs_dim
+        self.goal_dim = goal_dim
+        self.action_dim = action_dim
         self.history_length = history_length
         self.encoder = mlp(goal_dim, [2048, 1024, 512, 256], latent_dim)
-        self.decoder = mlp(latent_dim + obs_dim * history_length, [2048, 1024, 512, 256], NUM_JOINTS)
+        self.decoder = mlp(latent_dim + obs_dim * history_length, [2048, 1024, 512, 256], action_dim)
         with torch.no_grad():
             self.decoder[-1].weight.mul_(0.01)
             self.decoder[-1].bias.zero_()

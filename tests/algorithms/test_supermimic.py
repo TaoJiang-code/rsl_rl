@@ -4,7 +4,12 @@ import torch
 
 from rsl_rl.algorithms.supermimic.buffer import ReplayBuffer
 from rsl_rl.algorithms.supermimic.kinematics import UrdfKinematics
-from rsl_rl.algorithms.supermimic.mdp import flatten_state, unflatten_state
+from rsl_rl.algorithms.supermimic.mdp import (
+    G1_ROBOT_SPEC,
+    SuperMimicRobotSpec,
+    flatten_state,
+    unflatten_state,
+)
 from rsl_rl.algorithms.supermimic.rotations import so3_exp, so3_log
 
 
@@ -43,7 +48,7 @@ def test_state_and_rotation_round_trip():
 
 
 def test_replay_window_masks_episode_boundaries():
-    replay = ReplayBuffer(time_steps=8, num_envs=2, device="cpu")
+    replay = ReplayBuffer(time_steps=8, num_envs=2, device="cpu", robot_spec=G1_ROBOT_SPEC)
     for step in range(6):
         replay.add({
             "s": torch.zeros(2, 71), "s1": torch.zeros(2, 71),
@@ -56,6 +61,28 @@ def test_replay_window_masks_episode_boundaries():
     assert sample["s"].shape == (64, 4, 71)
     assert sample["mask"].shape == (64, 4)
     assert torch.all((sample["mask"] == 0) | (sample["mask"] == 1))
+
+
+def test_q1_robot_spec_dimensions():
+    spec = SuperMimicRobotSpec(num_joints=22, num_tracked_bodies=12)
+    assert spec.state_dim == 57
+    assert spec.observation_dim == 78
+    assert spec.context_dim == 26
+    assert spec.goal_step_dim == 59
+    assert spec.state_increment_dim == 56
+    assert spec.critic_extra_dim == 93
+    assert spec.goal_dim(10) == 590
+    state = (
+        torch.randn(4, 3),
+        torch.eye(3).expand(4, -1, -1),
+        torch.randn(4, 3),
+        torch.randn(4, 3),
+        torch.randn(4, 22),
+        torch.randn(4, 22),
+    )
+    rebuilt = unflatten_state(flatten_state(state))
+    for actual, expected in zip(rebuilt, state):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_urdf_fk_shapes_and_joint_mapping():

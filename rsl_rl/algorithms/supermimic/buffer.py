@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import torch
 
-from .mdp import NUM_JOINTS, STATE_DIM, XI_DIM
+from .mdp import SuperMimicRobotSpec
 
 
 class ReplayBuffer:
-    def __init__(self, time_steps: int, num_envs: int, device: str):
+    def __init__(
+        self,
+        time_steps: int,
+        num_envs: int,
+        device: str,
+        robot_spec: SuperMimicRobotSpec,
+    ):
         self.time_steps = time_steps
         self.num_envs = num_envs
         self.device = device
         fields = {
-            "s": ((STATE_DIM,), torch.float32),
-            "s1": ((STATE_DIM,), torch.float32),
-            "a": ((NUM_JOINTS,), torch.float32),
-            "a_prev": ((NUM_JOINTS,), torch.float32),
-            "xi": ((XI_DIM,), torch.float32),
+            "s": ((robot_spec.state_dim,), torch.float32),
+            "s1": ((robot_spec.state_dim,), torch.float32),
+            "a": ((robot_spec.num_joints,), torch.float32),
+            "a_prev": ((robot_spec.num_joints,), torch.float32),
+            "xi": ((robot_spec.context_dim,), torch.float32),
             "r": ((), torch.float32),
             "f": ((), torch.long),
             "ep_step": ((), torch.int32),

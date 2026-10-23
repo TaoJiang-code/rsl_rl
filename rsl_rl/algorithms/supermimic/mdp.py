@@ -8,16 +8,78 @@ import torch
 
 from .rotations import mat_to_6d, mat_to_quat, quat_to_mat, rot_angle_sq, yaw_mat
 
-NUM_JOINTS = 29
-NUM_TRACKED_BODIES = 14
-STATE_DIM = 71
-OBS_DIM = 99
-XI_DIM = 33
-GOAL_STEP_DIM = 73
-INV_DIM = 1 + 6 + 3 + 3 + NUM_JOINTS + NUM_JOINTS
-STATE_INCREMENT_DIM = 3 + 3 + 3 + 3 + NUM_JOINTS + NUM_JOINTS
-CRITIC_EXTRA_DIM = NUM_JOINTS + NUM_TRACKED_BODIES * 3 + 3 + 6 + XI_DIM
 CONTROL_DT = 0.02
+
+
+@dataclass(frozen=True)
+class SuperMimicRobotSpec:
+    """Robot-dependent tensor dimensions used by the shared SuperMimic implementation."""
+
+    num_joints: int
+    num_tracked_bodies: int
+
+    def __post_init__(self) -> None:
+        if self.num_joints <= 0:
+            raise ValueError("SuperMimic requires at least one joint.")
+        if self.num_tracked_bodies <= 0:
+            raise ValueError("SuperMimic requires at least one tracked body.")
+
+    @property
+    def state_dim(self) -> int:
+        return 13 + 2 * self.num_joints
+
+    @property
+    def observation_dim(self) -> int:
+        return 12 + 3 * self.num_joints
+
+    @property
+    def context_dim(self) -> int:
+        return 4 + self.num_joints
+
+    @property
+    def goal_step_dim(self) -> int:
+        return 15 + 2 * self.num_joints
+
+    @property
+    def invariant_dim(self) -> int:
+        return 13 + 2 * self.num_joints
+
+    @property
+    def state_increment_dim(self) -> int:
+        return 12 + 2 * self.num_joints
+
+    @property
+    def critic_extra_dim(self) -> int:
+        return self.num_joints + 3 * self.num_tracked_bodies + 9 + self.context_dim
+
+    def goal_dim(self, goal_frames: int) -> int:
+        return self.goal_step_dim * goal_frames
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "num_joints": self.num_joints,
+            "num_tracked_bodies": self.num_tracked_bodies,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, int]) -> "SuperMimicRobotSpec":
+        return cls(
+            num_joints=int(value["num_joints"]),
+            num_tracked_bodies=int(value["num_tracked_bodies"]),
+        )
+
+
+# Backward-compatible constants for the existing G1 task and external imports.
+G1_ROBOT_SPEC = SuperMimicRobotSpec(num_joints=29, num_tracked_bodies=14)
+NUM_JOINTS = G1_ROBOT_SPEC.num_joints
+NUM_TRACKED_BODIES = G1_ROBOT_SPEC.num_tracked_bodies
+STATE_DIM = G1_ROBOT_SPEC.state_dim
+OBS_DIM = G1_ROBOT_SPEC.observation_dim
+XI_DIM = G1_ROBOT_SPEC.context_dim
+GOAL_STEP_DIM = G1_ROBOT_SPEC.goal_step_dim
+INV_DIM = G1_ROBOT_SPEC.invariant_dim
+STATE_INCREMENT_DIM = G1_ROBOT_SPEC.state_increment_dim
+CRITIC_EXTRA_DIM = G1_ROBOT_SPEC.critic_extra_dim
 
 
 def flatten_state(state) -> torch.Tensor:
@@ -25,14 +87,20 @@ def flatten_state(state) -> torch.Tensor:
     return torch.cat((p, mat_to_quat(rotation), v, w, q, qd), -1)
 
 
-def unflatten_state(value: torch.Tensor):
+def unflatten_state(value: torch.Tensor, num_joints: int | None = None):
+    if num_joints is None:
+        num_joints = (value.shape[-1] - 13) // 2
+    expected_dim = 13 + 2 * num_joints
+    if value.shape[-1] != expected_dim:
+        raise ValueError(f"State has dimension {value.shape[-1]}, expected {expected_dim}.")
+    joint_position_end = 13 + num_joints
     return (
         value[..., 0:3],
         quat_to_mat(value[..., 3:7]),
         value[..., 7:10],
         value[..., 10:13],
-        value[..., 13:42],
-        value[..., 42:71],
+        value[..., 13:joint_position_end],
+        value[..., joint_position_end:expected_dim],
     )
 
 
@@ -54,8 +122,13 @@ def invariant_features(state) -> torch.Tensor:
 
 
 def normalize_context(context: torch.Tensor) -> torch.Tensor:
+    calibration_end = context.shape[-1] - 3
     return torch.cat(
-        ((context[..., :1] - 0.75) / 0.45, context[..., 1:30] / 0.01, context[..., 30:33] / 0.05),
+        (
+            (context[..., :1] - 0.75) / 0.45,
+            context[..., 1:calibration_end] / 0.01,
+            context[..., calibration_end:] / 0.05,
+        ),
         -1,
     )
 
@@ -75,9 +148,18 @@ class RewardConfig:
 
 
 class SuperMimicMDP:
-    def __init__(self, kinematics, motion, default_joint_position, soft_limits, cfg=RewardConfig()):
+    def __init__(
+        self,
+        kinematics,
+        motion,
+        default_joint_position,
+        soft_limits,
+        robot_spec: SuperMimicRobotSpec,
+        cfg=RewardConfig(),
+    ):
         self.kinematics = kinematics
         self.motion = motion
+        self.robot_spec = robot_spec
         self.default_joint_position = default_joint_position
         self.soft_lower = soft_limits[..., 0]
         self.soft_upper = soft_limits[..., 1]
@@ -85,11 +167,11 @@ class SuperMimicMDP:
         device = default_joint_position.device
         self.obs_noise = torch.cat(
             (
-                torch.full((29,), 0.01),
-                torch.full((29,), 0.5),
+                torch.full((robot_spec.num_joints,), 0.01),
+                torch.full((robot_spec.num_joints,), 0.5),
                 torch.full((3,), 0.2),
                 torch.full((3,), 0.05),
-                torch.zeros(29),
+                torch.zeros(robot_spec.num_joints),
                 torch.full((6,), 0.05),
             )
         ).to(device)
@@ -100,7 +182,7 @@ class SuperMimicMDP:
     def observation(self, state, previous_action, context, frame) -> torch.Tensor:
         _, rotation, _, w, q, qd = state
         rotation_t = rotation.transpose(-1, -2)
-        calibration = context[..., 1:30]
+        calibration = context[..., 1 : 1 + self.robot_spec.num_joints]
         projected_gravity = -rotation[..., 2, :]
         relative_reference = mat_to_6d(rotation_t @ quat_to_mat(self.motion.body_quat_w[frame, 0]))
         return torch.cat(
