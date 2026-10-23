@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -63,6 +64,13 @@ class SuperMimicAlgorithm:
         self.reward_termination = self._reward_termination
         self.critic_input = self._critic_input
         if cfg.get("compile", True):
+            compile_threads = int(cfg.get("compile_threads", 0))
+            if compile_threads > 0:
+                os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(compile_threads)
+                from torch._inductor import config as inductor_config
+
+                inductor_config.compile_threads = compile_threads
+                print(f"[INFO] TorchInductor compile threads: {compile_threads}")
             self.world_model_rollout = torch.compile(self._world_model_rollout)
             self.world_model_error = torch.compile(self._world_model_error)
             self.imagination_step = torch.compile(self._imagination_step)
