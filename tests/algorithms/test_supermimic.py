@@ -99,3 +99,34 @@ def test_urdf_fk_shapes_and_joint_mapping():
     assert result[1].shape == (batch, 14, 3, 3)
     assert result[2].shape == (batch, 14, 3)
     assert result[3].shape == (batch, 14, 3)
+
+
+def test_urdf_fk_returns_center_of_mass_linear_velocity():
+    root = Path(__file__).resolve().parents[3]
+    urdf = root / "Glush_Zoo/g1_description/urdf/g1_29dof_rev_1_0.urdf"
+    kinematics = UrdfKinematics(urdf, JOINT_NAMES, TRACKED_BODIES, "base", "cpu")
+    identity = torch.eye(3).unsqueeze(0)
+    root_position = torch.zeros(1, 3)
+    root_com_velocity = torch.tensor([[0.2, -0.1, 0.3]])
+    root_angular_velocity = torch.tensor([[0.0, 0.0, 2.0]])
+    body_position, body_rotation, body_velocity, _ = kinematics.forward(
+        root_position,
+        identity,
+        root_com_velocity,
+        root_angular_velocity,
+        torch.zeros(1, 29),
+        torch.zeros(1, 29),
+    )
+    tracked_com_offsets = kinematics.com_offsets[kinematics.tracked_indices]
+    body_com_position = body_position + (
+        body_rotation @ tracked_com_offsets.unsqueeze(-1)
+    ).squeeze(-1)
+    root_com_position = root_position + (
+        identity @ kinematics.com_offsets[0].view(1, 3, 1)
+    ).squeeze(-1)
+    expected_velocity = root_com_velocity[:, None] + torch.cross(
+        root_angular_velocity[:, None].expand_as(body_com_position),
+        body_com_position - root_com_position[:, None],
+        dim=-1,
+    )
+    torch.testing.assert_close(body_velocity, expected_velocity, atol=1e-5, rtol=1e-5)

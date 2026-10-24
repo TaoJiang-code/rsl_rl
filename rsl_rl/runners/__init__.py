@@ -16,6 +16,7 @@ from .rgmt_runner import RGMTRunner
 from .rgmt_stage2_runner import RGMTStageIIRunner
 from .sonic_lora_runner import SonicLoRARunner
 from .supermimic_runner import SuperMimicRunner
+from .super_rgmt_runner import SuperRGMTRunner
 
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "RGMTStageIIRunner",
     "SonicLoRARunner",
     "SuperMimicRunner",
+    "SuperRGMTRunner",
 ]

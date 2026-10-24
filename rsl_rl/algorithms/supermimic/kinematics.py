@@ -27,6 +27,11 @@ class UrdfKinematics:
     ):
         root = ET.parse(urdf_path).getroot()
         joint_to_index = {name: index for index, name in enumerate(joint_names)}
+        link_com_offsets = {}
+        for link in root.findall("link"):
+            inertial_origin = link.find("inertial/origin")
+            xyz = None if inertial_origin is None else inertial_origin.attrib.get("xyz")
+            link_com_offsets[link.attrib["name"]] = _vec(xyz, (0.0, 0.0, 0.0))
         pending = list(root.findall("joint"))
         body_names = [root_body_name]
         body_to_index = {root_body_name: 0}
@@ -35,6 +40,7 @@ class UrdfKinematics:
         axes = [[0.0, 0.0, 1.0]]
         offsets = [[0.0, 0.0, 0.0]]
         offset_rpy = [[0.0, 0.0, 0.0]]
+        com_offsets = [link_com_offsets.get(root_body_name, [0.0, 0.0, 0.0])]
 
         while pending:
             progressed = False
@@ -56,6 +62,7 @@ class UrdfKinematics:
                 axes.append(_vec(None if axis is None else axis.attrib.get("xyz"), (0.0, 0.0, 1.0)))
                 offsets.append(_vec(None if origin is None else origin.attrib.get("xyz"), (0.0, 0.0, 0.0)))
                 offset_rpy.append(_vec(None if origin is None else origin.attrib.get("rpy"), (0.0, 0.0, 0.0)))
+                com_offsets.append(link_com_offsets.get(child_name, [0.0, 0.0, 0.0]))
                 pending.remove(element)
                 progressed = True
             if not progressed:
@@ -71,13 +78,18 @@ class UrdfKinematics:
         self.axes = torch.tensor(axes, dtype=torch.float32, device=device)
         self.offsets = torch.tensor(offsets, dtype=torch.float32, device=device)
         self.offset_rotations = rpy_to_mat(torch.tensor(offset_rpy, dtype=torch.float32, device=device))
+        self.com_offsets = torch.tensor(com_offsets, dtype=torch.float32, device=device)
         self.tracked_indices = [body_to_index[name] for name in tracked_body_names]
 
     def forward(self, p, rotation, v, w, q, qd):
+        """Return link-frame poses and PhysX-compatible center-of-mass velocities."""
         count = len(self.body_names)
         positions, rotations = [None] * count, [None] * count
+        origin_linear_velocities = [None] * count
         linear_velocities, angular_velocities = [None] * count, [None] * count
         positions[0], rotations[0] = p, rotation
+        root_com_displacement = (rotation @ self.com_offsets[0].unsqueeze(-1)).squeeze(-1)
+        origin_linear_velocities[0] = v - torch.cross(w, root_com_displacement, dim=-1)
         linear_velocities[0], angular_velocities[0] = v, w
         for index in range(1, count):
             parent = self.parent[index]
@@ -93,10 +105,15 @@ class UrdfKinematics:
             else:
                 child_rotation = offset_rotation
                 angular_velocity = angular_velocities[parent]
-            linear_velocity = linear_velocities[parent] + torch.cross(
+            origin_linear_velocity = origin_linear_velocities[parent] + torch.cross(
                 angular_velocities[parent], displacement, dim=-1
             )
+            com_displacement = (child_rotation @ self.com_offsets[index].unsqueeze(-1)).squeeze(-1)
+            linear_velocity = origin_linear_velocity + torch.cross(
+                angular_velocity, com_displacement, dim=-1
+            )
             positions[index], rotations[index] = position, child_rotation
+            origin_linear_velocities[index] = origin_linear_velocity
             linear_velocities[index], angular_velocities[index] = linear_velocity, angular_velocity
         ids = self.tracked_indices
         return (
