@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import torch
+from tensordict import TensorDict
 
 from rsl_rl.algorithms.super_rgmt import RewardConfig, SuperRGMTAlgorithm, SuperRGMTMDP, SuperRGMTRobotSpec
 from rsl_rl.algorithms.supermimic.kinematics import UrdfKinematics
@@ -161,10 +162,30 @@ class SuperRGMTRunner:
 
     def _get_observations(self):
         result = self.env.get_observations()
-        return result[0] if isinstance(result, tuple) else result
+        if isinstance(result, tuple):
+            observation, extras = result
+        else:
+            observation, extras = result, {}
+        return self._to_tensordict(observation, extras)
 
     def _step(self, actions: torch.Tensor):
-        return self.env.step(actions)
+        observation, reward, done, extras = self.env.step(actions)
+        return self._to_tensordict(observation, extras), reward, done, extras
+
+    def _to_tensordict(self, observation, extras: dict) -> TensorDict:
+        """Restore named observation groups from legacy IsaacLab wrapper output."""
+        if isinstance(observation, TensorDict):
+            return observation
+        if isinstance(observation, dict):
+            return TensorDict(observation, batch_size=[self.env.num_envs], device=self.env.device)
+
+        data = {"policy": observation}
+        grouped_observations = extras.get("observations", {})
+        if isinstance(grouped_observations, dict):
+            for name, value in grouped_observations.items():
+                if name != "policy":
+                    data[name] = value
+        return TensorDict(data, batch_size=[self.env.num_envs], device=self.env.device)
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         self.git_status_repos.append(repo_file_path)
@@ -186,7 +207,7 @@ class SuperRGMTRunner:
                 -float(self.cfg["clip_actions"]),
                 float(self.cfg["clip_actions"]),
             )
-            next_observation, reward, done, extras = self.env.step(action)
+            next_observation, reward, done, extras = self._step(action)
             transition_info = extras.get("super_rgmt")
             if transition_info is None:
                 raise RuntimeError("Super-RGMT environment did not expose its pre-reset transition state.")

@@ -1,8 +1,11 @@
+from types import SimpleNamespace
+
 import torch
 
 from rsl_rl.algorithms.super_rgmt.algorithm import SuperRGMTAlgorithm
 from rsl_rl.algorithms.super_rgmt.buffer import ReplayBuffer
 from rsl_rl.algorithms.super_rgmt.mdp import SuperRGMTRobotSpec
+from rsl_rl.runners.super_rgmt_runner import SuperRGMTRunner
 
 
 def _transition(spec: SuperRGMTRobotSpec, num_envs: int, step: int) -> dict[str, torch.Tensor]:
@@ -56,3 +59,19 @@ def test_imagined_dropout_continues_saved_burst():
     torch.testing.assert_close(next_cached[1], command[1])
     assert torch.equal(next_remaining, torch.tensor([1, 0]))
     assert torch.equal(active, torch.tensor([True, False]))
+
+
+def test_runner_restores_observation_groups_from_legacy_wrapper_output():
+    runner = SuperRGMTRunner.__new__(SuperRGMTRunner)
+    runner.env = SimpleNamespace(num_envs=2, device="cpu")
+    policy = torch.zeros(2, 3)
+    history = torch.ones(2, 4, 5)
+
+    observation = runner._to_tensordict(
+        policy,
+        {"observations": {"policy": policy, "proprio_history": history}},
+    )
+
+    assert set(observation.keys()) == {"policy", "proprio_history"}
+    torch.testing.assert_close(observation["policy"], policy)
+    torch.testing.assert_close(observation["proprio_history"], history)
