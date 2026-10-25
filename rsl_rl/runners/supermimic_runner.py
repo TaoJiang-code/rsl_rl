@@ -163,7 +163,8 @@ class SuperMimicRunner:
             "policy_loss", "critic_loss", "imagined_reward", "policy_gradient_norm",
             "imagined_survival", "sim_reward", "episode_length", "normalized_return",
             "real_recovery_ratio", "replay_recovery_ratio", "imagined_recovery_ratio",
-            "recovery_assist_anneal", "termination_fraction", "iterations_per_second", "learning_rate",
+            "valid_imagined_start_ratio", "recovery_assist_anneal", "termination_fraction",
+            "iterations_per_second", "learning_rate",
         ]
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=columns)
         if not exists:
@@ -186,6 +187,7 @@ class SuperMimicRunner:
             "real_recovery_ratio": self._mean(stats["recovery_ratio"]),
             "replay_recovery_ratio": self._mean(aggregate["replay_recovery_ratio"]),
             "imagined_recovery_ratio": self._mean(aggregate["imagined_recovery_ratio"]),
+            "valid_imagined_start_ratio": self._mean(aggregate["valid_imagined_start_ratio"]),
             "recovery_assist_anneal": float(self.motion.recovery_assist_anneal),
             "sim_reward": self._mean(stats["sim_reward"]),
             "episode_length": self._mean(stats["episode_length"]),
@@ -226,7 +228,7 @@ class SuperMimicRunner:
         aggregate = {name: [] for name in (
             "world_model_loss", "world_model_error_8", "policy_loss", "critic_loss",
             "imagined_reward", "policy_gradient_norm", "imagined_survival",
-            "replay_recovery_ratio", "imagined_recovery_ratio",
+            "replay_recovery_ratio", "imagined_recovery_ratio", "valid_imagined_start_ratio",
         )}
         start_time = time.time() - self.wall_time_offset
         interval_start = time.time()

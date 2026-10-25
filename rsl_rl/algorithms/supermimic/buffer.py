@@ -65,6 +65,14 @@ class ReplayBuffer:
             raise RuntimeError("Cannot sample an empty replay buffer.")
         age = torch.randint(0, self.size, (batch_size,), device=self.device)
         env = torch.randint(0, self.num_envs, (batch_size,), device=self.device)
+        return self._gather_starts(age, env, history_length)
+
+    def _gather_starts(
+        self,
+        age: torch.Tensor,
+        env: torch.Tensor,
+        history_length: int,
+    ):
         row = self._row(age)
         episode_step = self.data["ep_step"][row, env].long()
         back = torch.arange(history_length - 1, -1, -1, device=self.device)
@@ -80,3 +88,34 @@ class ReplayBuffer:
             name: self.data[name][history_rows, history_envs] for name in ("s", "a_prev", "xi", "f")
         }
         return start, history
+
+    def sample_valid_starts(
+        self,
+        batch_size: int,
+        history_length: int,
+        frame_clip_ids: torch.Tensor,
+        clip_ends: torch.Tensor,
+        horizon: int,
+    ):
+        """Sample uniformly from every replay entry that can support a full imagined rollout."""
+        if self.size == 0:
+            raise RuntimeError("Cannot sample an empty replay buffer.")
+        ages = torch.arange(self.size, device=self.device)
+        rows = self._row(ages)
+        frames = self.data["f"][rows]
+        ends = clip_ends[frame_clip_ids[frames]]
+        valid_entries = (frames + horizon <= ends).nonzero(as_tuple=False)
+        valid_count = int(valid_entries.shape[0])
+        total_count = self.size * self.num_envs
+        if valid_count == 0:
+            remaining = (ends - frames).amax().item()
+            raise RuntimeError(
+                "SuperMimic replay has no valid imagined-rollout starts: "
+                f"horizon={horizon}, replay_entries={total_count}, "
+                f"maximum_remaining_frames={remaining}."
+            )
+        selected = torch.randint(0, valid_count, (batch_size,), device=self.device)
+        entries = valid_entries[selected]
+        start, history = self._gather_starts(entries[:, 0], entries[:, 1], history_length)
+        valid_ratio = valid_count / total_count
+        return start, history, valid_ratio

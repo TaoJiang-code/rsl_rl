@@ -150,17 +150,38 @@ class SuperMimicAlgorithm:
     def _sample_valid_starts(self, batch_size: int):
         starts, histories = [], []
         collected = 0
-        while collected < batch_size:
+        valid_candidates = 0
+        total_candidates = 0
+        for _ in range(8):
             start, history = self.replay.sample_starts(2 * batch_size, self.history_length)
             frame = start["f"]
             clip_end = self.motion.clip_ends[self.motion.frame_clip_ids[frame]]
             valid = frame + self.horizon <= clip_end
+            valid_candidates += int(valid.sum())
+            total_candidates += valid.numel()
             ids = valid.nonzero(as_tuple=False).squeeze(-1)[: batch_size - collected]
             if ids.numel() == 0:
                 continue
             starts.append({key: value[ids] for key, value in start.items()})
             histories.append({key: value[ids] for key, value in history.items()})
             collected += ids.numel()
+            if collected >= batch_size:
+                break
+        if collected < batch_size:
+            start, history, valid_ratio = self.replay.sample_valid_starts(
+                batch_size - collected,
+                self.history_length,
+                self.motion.frame_clip_ids,
+                self.motion.clip_ends,
+                self.horizon,
+            )
+            starts.append(start)
+            histories.append(history)
+            self.valid_imagined_start_ratio = torch.tensor(valid_ratio, device=self.device)
+        else:
+            self.valid_imagined_start_ratio = torch.tensor(
+                valid_candidates / max(total_candidates, 1), device=self.device
+            )
         concatenate = lambda values: {  # noqa: E731
             key: torch.cat([entry[key] for entry in values]) for key in values[0]
         }
@@ -309,6 +330,7 @@ class SuperMimicAlgorithm:
             "imagined_reward": (detached_reward_sum / self.horizon / 0.1).mean(),
             "policy_gradient_norm": gradient_norm.detach(),
             "imagined_survival": final_survival.mean().detach(),
+            "valid_imagined_start_ratio": self.valid_imagined_start_ratio.detach(),
         }
         if self.mdp.context_layout is not None:
             result["replay_recovery_ratio"] = start["xi"][

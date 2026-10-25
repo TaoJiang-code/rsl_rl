@@ -65,6 +65,27 @@ def test_replay_window_masks_episode_boundaries():
     assert torch.all((sample["mask"] == 0) | (sample["mask"] == 1))
 
 
+def test_replay_samples_only_full_horizon_starts():
+    replay = ReplayBuffer(time_steps=4, num_envs=2, device="cpu", robot_spec=G1_ROBOT_SPEC)
+    frames = (0, 3, 4, 7)
+    for step, frame in enumerate(frames):
+        replay.add({
+            "s": torch.zeros(2, 71), "s1": torch.zeros(2, 71),
+            "a": torch.zeros(2, 29), "a_prev": torch.zeros(2, 29),
+            "xi": torch.zeros(2, 33), "r": torch.zeros(2),
+            "f": torch.full((2,), frame), "ep_step": torch.full((2,), step, dtype=torch.int32),
+            "done": torch.zeros(2, dtype=torch.bool),
+        })
+    frame_clip_ids = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+    clip_ends = torch.tensor([4, 9])
+    start, history, valid_ratio = replay.sample_valid_starts(
+        64, 2, frame_clip_ids, clip_ends, horizon=2
+    )
+    assert torch.all((start["f"] == 0) | (start["f"] == 7))
+    assert history["f"].shape == (64, 2)
+    assert valid_ratio == 0.5
+
+
 def test_q1_robot_spec_dimensions():
     spec = SuperMimicRobotSpec(num_joints=22, num_tracked_bodies=12)
     assert spec.state_dim == 57
