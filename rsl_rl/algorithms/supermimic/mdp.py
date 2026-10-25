@@ -17,12 +17,15 @@ class SuperMimicRobotSpec:
 
     num_joints: int
     num_tracked_bodies: int
+    context_dim_override: int | None = None
 
     def __post_init__(self) -> None:
         if self.num_joints <= 0:
             raise ValueError("SuperMimic requires at least one joint.")
         if self.num_tracked_bodies <= 0:
             raise ValueError("SuperMimic requires at least one tracked body.")
+        if self.context_dim_override is not None and self.context_dim_override <= 0:
+            raise ValueError("SuperMimic context dimension must be positive.")
 
     @property
     def state_dim(self) -> int:
@@ -34,7 +37,7 @@ class SuperMimicRobotSpec:
 
     @property
     def context_dim(self) -> int:
-        return 4 + self.num_joints
+        return 4 + self.num_joints if self.context_dim_override is None else self.context_dim_override
 
     @property
     def goal_step_dim(self) -> int:
@@ -56,16 +59,22 @@ class SuperMimicRobotSpec:
         return self.goal_step_dim * goal_frames
 
     def to_dict(self) -> dict[str, int]:
-        return {
+        value = {
             "num_joints": self.num_joints,
             "num_tracked_bodies": self.num_tracked_bodies,
         }
+        if self.context_dim_override is not None and self.context_dim_override != 4 + self.num_joints:
+            value["context_dim"] = self.context_dim_override
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, int]) -> "SuperMimicRobotSpec":
         return cls(
             num_joints=int(value["num_joints"]),
             num_tracked_bodies=int(value["num_tracked_bodies"]),
+            context_dim_override=(
+                int(value["context_dim"]) if "context_dim" in value else None
+            ),
         )
 
 
@@ -155,11 +164,13 @@ class SuperMimicMDP:
         default_joint_position,
         soft_limits,
         robot_spec: SuperMimicRobotSpec,
+        context_layout=None,
         cfg=RewardConfig(),
     ):
         self.kinematics = kinematics
         self.motion = motion
         self.robot_spec = robot_spec
+        self.context_layout = context_layout
         self.default_joint_position = default_joint_position
         self.soft_lower = soft_limits[..., 0]
         self.soft_upper = soft_limits[..., 1]
@@ -182,9 +193,17 @@ class SuperMimicMDP:
     def observation(self, state, previous_action, context, frame) -> torch.Tensor:
         _, rotation, _, w, q, qd = state
         rotation_t = rotation.transpose(-1, -2)
-        calibration = context[..., 1 : 1 + self.robot_spec.num_joints]
+        calibration_slice = (
+            slice(1, 1 + self.robot_spec.num_joints)
+            if self.context_layout is None
+            else self.context_layout.calibration_offset
+        )
+        calibration = context[..., calibration_slice]
         projected_gravity = -rotation[..., 2, :]
-        relative_reference = mat_to_6d(rotation_t @ quat_to_mat(self.motion.body_quat_w[frame, 0]))
+        relative_reference = mat_to_6d(
+            rotation_t
+            @ quat_to_mat(self.motion.gather_command_motion("body_quat_w", frame)[..., 0, :])
+        )
         return torch.cat(
             (
                 q - self.default_joint_position - calibration,
@@ -243,7 +262,30 @@ class SuperMimicMDP:
             }
         return reward
 
-    def soft_termination(self, state, frame, height_temperature=0.02, tilt_temperature=0.04):
+    def advance_context(
+        self,
+        context: torch.Tensor,
+        episode_step: torch.Tensor,
+        recovery_window_steps: int,
+    ) -> torch.Tensor:
+        if self.context_layout is None:
+            return context
+        updated = context.clone()
+        was_active = context[..., self.context_layout.recovery_active].squeeze(-1) > 0.5
+        active = was_active & (episode_step < recovery_window_steps)
+        updated[..., self.context_layout.recovery_active] = active[..., None].to(context.dtype)
+        assist = updated[..., self.context_layout.recovery_assist]
+        updated[..., self.context_layout.recovery_assist] = assist * active[..., None]
+        return updated
+
+    def soft_termination(
+        self,
+        state,
+        frame,
+        context: torch.Tensor | None = None,
+        height_temperature=0.02,
+        tilt_temperature=0.04,
+    ):
         p, rotation = state[0], state[1]
         reference_p = self.motion.body_pos_w[frame, 0]
         reference_r = quat_to_mat(self.motion.body_quat_w[frame, 0])
@@ -252,7 +294,11 @@ class SuperMimicMDP:
         alive = (1 - torch.sigmoid((height_error - self.cfg.termination_height) / height_temperature)) * (
             1 - torch.sigmoid((tilt_error - self.cfg.termination_tilt) / tilt_temperature)
         )
-        return 1 - alive
+        failure = 1 - alive
+        if context is not None and self.context_layout is not None:
+            recovery_active = context[..., self.context_layout.recovery_active].squeeze(-1)
+            failure = failure * (1.0 - recovery_active)
+        return failure
 
     def critic_features(self, state, frame, normalized_context):
         p, rotation, v, w, q, qd = state

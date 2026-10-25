@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -6,6 +7,7 @@ from rsl_rl.algorithms.supermimic.buffer import ReplayBuffer
 from rsl_rl.algorithms.supermimic.kinematics import UrdfKinematics
 from rsl_rl.algorithms.supermimic.mdp import (
     G1_ROBOT_SPEC,
+    SuperMimicMDP,
     SuperMimicRobotSpec,
     flatten_state,
     unflatten_state,
@@ -83,6 +85,26 @@ def test_q1_robot_spec_dimensions():
     rebuilt = unflatten_state(flatten_state(state))
     for actual, expected in zip(rebuilt, state):
         torch.testing.assert_close(actual, expected)
+
+
+def test_full_physics_context_spec_and_recovery_expiry():
+    spec = SuperMimicRobotSpec(
+        num_joints=29,
+        num_tracked_bodies=14,
+        context_dim_override=219,
+    )
+    assert spec.context_dim == 219
+    assert SuperMimicRobotSpec.from_dict(spec.to_dict()) == spec
+
+    mdp = SuperMimicMDP.__new__(SuperMimicMDP)
+    mdp.context_layout = SimpleNamespace(
+        recovery_assist=slice(0, 1),
+        recovery_active=slice(1, 2),
+    )
+    context = torch.tensor([[80.0, 1.0], [50.0, 1.0], [0.0, 0.0]])
+    updated = mdp.advance_context(context, torch.tensor([149, 150, 20]), 150)
+    torch.testing.assert_close(updated[:, 0], torch.tensor([80.0, 0.0, 0.0]))
+    torch.testing.assert_close(updated[:, 1], torch.tensor([1.0, 0.0, 0.0]))
 
 
 def test_urdf_fk_shapes_and_joint_mapping():

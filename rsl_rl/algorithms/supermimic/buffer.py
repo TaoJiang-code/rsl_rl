@@ -72,7 +72,10 @@ class ReplayBuffer:
         back = torch.minimum(back, age[:, None])
         history_rows = self._row(age[:, None] - back)
         history_envs = env[:, None].expand_as(history_rows)
-        start = {name: self.data[name][row, env] for name in ("s", "a_prev", "xi", "f")}
+        start = {
+            name: self.data[name][row, env]
+            for name in ("s", "a_prev", "xi", "f", "ep_step")
+        }
         history = {
             name: self.data[name][history_rows, history_envs] for name in ("s", "a_prev", "xi", "f")
         }

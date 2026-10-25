@@ -14,7 +14,7 @@ from .mdp import (
     normalize_context,
     unflatten_state,
 )
-from .networks import Critic, Policy, WorldModel
+from .networks import Critic, Policy, RunningNorm, WorldModel
 from . import networks
 
 
@@ -42,6 +42,11 @@ class SuperMimicAlgorithm:
             self.history_length,
         ).to(device)
         self.critic = Critic(critic_dim).to(device)
+        self.context_norm = (
+            RunningNorm(self.robot_spec.context_dim).to(device)
+            if self.mdp.context_layout is not None
+            else None
+        )
         self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=self.base_learning_rate)
         self.policy_optimizer = torch.optim.Adam(
             self.policy.parameters(), lr=self.base_learning_rate, betas=(0.9, 0.95)
@@ -98,9 +103,16 @@ class SuperMimicAlgorithm:
         self.policy.goal_norm.update(goal)
         state = unflatten_state(transition["s"])
         next_state = unflatten_state(transition["s1"])
-        context = normalize_context(transition["xi"])
+        if self.context_norm is not None:
+            self.context_norm.update(transition["xi"])
+        context = self._normalize_context(transition["xi"])
         self.world_model.in_norm.update(self.world_model.inputs(state, transition["a"], context))
         self.world_model.out_norm.update(self.world_model.targets(state, next_state))
+
+    def _normalize_context(self, context: torch.Tensor) -> torch.Tensor:
+        if self.context_norm is not None:
+            return self.context_norm(context)
+        return normalize_context(context)
 
     def _world_model_rollout(self, state, action, context):
         state = unflatten_state(state[:, 0])
@@ -109,7 +121,7 @@ class SuperMimicAlgorithm:
             state = self.world_model.step(
                 state,
                 action[:, step],
-                normalize_context(context[:, step]),
+                self._normalize_context(context[:, step]),
             )
             predictions.append(state)
         predicted = tuple(torch.stack([value[index] for value in predictions], 1) for index in range(6))
@@ -171,10 +183,10 @@ class SuperMimicAlgorithm:
         next_goal = self.mdp.goal(next_frame, self.goal_frames)
         return next_state, action, next_history, next_frame, next_goal
 
-    def _reward_termination(self, state, frame, action, previous_action):
+    def _reward_termination(self, state, frame, action, previous_action, context):
         return (
             self.mdp.reward(state, frame, action, previous_action),
-            self.mdp.soft_termination(state, frame),
+            self.mdp.soft_termination(state, frame, context),
         )
 
     def policy_update(self) -> dict[str, torch.Tensor]:
@@ -183,8 +195,9 @@ class SuperMimicAlgorithm:
         state = unflatten_state(start["s"])
         initial_state = state
         context = start["xi"]
-        normalized_context = normalize_context(context)
+        normalized_context = self._normalize_context(context)
         frame = start["f"]
+        episode_step = start["ep_step"].long()
         previous_action = start["a_prev"]
         with torch.no_grad():
             observation_history = self.mdp.observation(
@@ -197,6 +210,7 @@ class SuperMimicAlgorithm:
         initial_goal = self.mdp.goal(frame, self.goal_frames)
         goal = initial_goal
         states, actions, previous_actions, frames, goals = [], [], [], [], []
+        contexts = [context]
         for _ in range(self.horizon):
             previous_actions.append(previous_action)
             state, previous_action, observation_history, frame, goal = self.imagination_step(
@@ -206,6 +220,14 @@ class SuperMimicAlgorithm:
             actions.append(previous_action)
             frames.append(frame)
             goals.append(goal)
+            episode_step = episode_step + 1
+            context = self.mdp.advance_context(
+                context,
+                episode_step,
+                int(self.cfg["recovery_window_steps"]),
+            )
+            normalized_context = self._normalize_context(context)
+            contexts.append(context)
 
         flatten = lambda values: torch.stack(values).flatten(0, 1)  # noqa: E731
         all_states = tuple(flatten([state_at_time[index] for state_at_time in states]) for index in range(6))
@@ -214,6 +236,7 @@ class SuperMimicAlgorithm:
             flatten(frames),
             flatten(actions),
             flatten(previous_actions),
+            flatten(contexts[1:]),
         )
         rewards = rewards.view(self.horizon, batch_size)
         terminations = terminations.view(self.horizon, batch_size)
@@ -250,7 +273,7 @@ class SuperMimicAlgorithm:
                 )
                 critic_frames = torch.cat((start["f"][None], torch.stack(frames)), 0).flatten()
                 critic_goals = torch.cat((initial_goal[None], torch.stack(goals)), 0).flatten(0, 1)
-                critic_context = normalized_context[None].expand(self.horizon + 1, -1, -1).flatten(0, 1)
+                critic_context = self._normalize_context(torch.stack(contexts)).flatten(0, 1)
                 critic_inputs = self.critic_input(
                     critic_states, critic_frames, critic_context, critic_goals
                 ).view(self.horizon + 1, batch_size, -1)
@@ -280,13 +303,25 @@ class SuperMimicAlgorithm:
                     nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
                     self.critic_optimizer.step()
 
-        return {
+        result = {
             "policy_loss": policy_loss.detach(),
             "critic_loss": critic_loss.detach(),
             "imagined_reward": (detached_reward_sum / self.horizon / 0.1).mean(),
             "policy_gradient_norm": gradient_norm.detach(),
             "imagined_survival": final_survival.mean().detach(),
         }
+        if self.mdp.context_layout is not None:
+            result["replay_recovery_ratio"] = start["xi"][
+                ..., self.mdp.context_layout.recovery_active
+            ].float().mean().detach()
+            result["imagined_recovery_ratio"] = torch.stack(contexts[1:])[
+                ..., self.mdp.context_layout.recovery_active
+            ].float().mean().detach()
+        else:
+            zero = torch.zeros((), device=self.device)
+            result["replay_recovery_ratio"] = zero
+            result["imagined_recovery_ratio"] = zero
+        return result
 
     def state_dict(self) -> dict:
         return {
@@ -297,6 +332,7 @@ class SuperMimicAlgorithm:
             "world_model_optimizer": self.world_model_optimizer.state_dict(),
             "policy_optimizer": self.policy_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
+            "context_norm": None if self.context_norm is None else self.context_norm.state_dict(),
         }
 
     def load_state_dict(self, state: dict, load_optimizers: bool = True) -> None:
@@ -308,6 +344,11 @@ class SuperMimicAlgorithm:
         self.world_model.load_state_dict(state["world_model"])
         self.policy.load_state_dict(state["policy"])
         self.critic.load_state_dict(state["critic"])
+        saved_context_norm = state.get("context_norm")
+        if self.context_norm is not None:
+            if saved_context_norm is None:
+                raise ValueError("Checkpoint is missing the full SuperMimic context normalizer.")
+            self.context_norm.load_state_dict(saved_context_norm)
         if load_optimizers:
             self.world_model_optimizer.load_state_dict(state["world_model_optimizer"])
             self.policy_optimizer.load_state_dict(state["policy_optimizer"])

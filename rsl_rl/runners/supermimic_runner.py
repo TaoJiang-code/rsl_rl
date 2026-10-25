@@ -38,9 +38,11 @@ class SuperMimicRunner:
 
         self.motion = self.unwrapped.command_manager.get_term("motion")
         self.action_term = self.unwrapped.action_manager.get_term("joint_pos")
+        initial_context = self.unwrapped.refresh_supermimic_context()
         self.robot_spec = SuperMimicRobotSpec(
             num_joints=len(self.motion.cfg.joint_names),
             num_tracked_bodies=len(self.motion.cfg.tracked_body_names),
+            context_dim_override=initial_context.shape[-1],
         )
         if self.action_term.action_dim != self.robot_spec.num_joints:
             raise ValueError(
@@ -66,6 +68,10 @@ class SuperMimicRunner:
             default_joint_position,
             soft_limits,
             self.robot_spec,
+            context_layout=self.unwrapped.supermimic_context_layout,
+        )
+        self.algorithm_cfg["recovery_window_steps"] = max(
+            1, int(round(float(self.motion.cfg.recovery_window_s) / self.unwrapped.step_dt))
         )
         self.algorithm = SuperMimicAlgorithm(self.mdp, env.num_envs, self.algorithm_cfg, device)
         self.observation_history = torch.zeros(
@@ -75,6 +81,7 @@ class SuperMimicRunner:
             device=device,
         )
         print(f"[INFO] SuperMimic robot spec: {self.robot_spec.to_dict()}")
+        print(f"[INFO] SuperMimic physics context dimension: {self.robot_spec.context_dim}")
         self.writer = None
         self._csv_file = None
         self._csv_writer = None
@@ -87,7 +94,7 @@ class SuperMimicRunner:
         for _ in range(steps):
             state_flat = self.unwrapped.supermimic_state().clone()
             state = unflatten_state(state_flat)
-            context = self.unwrapped.supermimic_context.clone()
+            context = self.unwrapped.refresh_supermimic_context().clone()
             frame = self.motion.time_steps.clone()
             previous_action = self.action_term.raw_actions.clone()
             episode_step = self.unwrapped.episode_length_buf.clone()
@@ -126,6 +133,12 @@ class SuperMimicRunner:
             self.algorithm.update_normalizers(transition, observation, goal)
             self.sim_steps += self.env.num_envs
             statistics["sim_reward"].append(float(reward.mean() / 0.1))
+            layout = self.unwrapped.supermimic_context_layout
+            statistics["recovery_ratio"].append(
+                0.0
+                if layout is None
+                else float(context[..., layout.recovery_active].float().mean())
+            )
             if done.any():
                 ids = done.bool().nonzero(as_tuple=False).squeeze(-1)
                 statistics["episode_length"].append(float((episode_step[ids] + 1).float().mean()))
@@ -149,7 +162,8 @@ class SuperMimicRunner:
             "iteration", "wall_h", "sim_steps", "world_model_loss", "world_model_error_8",
             "policy_loss", "critic_loss", "imagined_reward", "policy_gradient_norm",
             "imagined_survival", "sim_reward", "episode_length", "normalized_return",
-            "termination_fraction", "iterations_per_second", "learning_rate",
+            "real_recovery_ratio", "replay_recovery_ratio", "imagined_recovery_ratio",
+            "recovery_assist_anneal", "termination_fraction", "iterations_per_second", "learning_rate",
         ]
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=columns)
         if not exists:
@@ -169,6 +183,10 @@ class SuperMimicRunner:
             "imagined_reward": self._mean(aggregate["imagined_reward"]),
             "policy_gradient_norm": self._mean(aggregate["policy_gradient_norm"]),
             "imagined_survival": self._mean(aggregate["imagined_survival"]),
+            "real_recovery_ratio": self._mean(stats["recovery_ratio"]),
+            "replay_recovery_ratio": self._mean(aggregate["replay_recovery_ratio"]),
+            "imagined_recovery_ratio": self._mean(aggregate["imagined_recovery_ratio"]),
+            "recovery_assist_anneal": float(self.motion.recovery_assist_anneal),
             "sim_reward": self._mean(stats["sim_reward"]),
             "episode_length": self._mean(stats["episode_length"]),
             "normalized_return": self._mean(stats["normalized_return"]),
@@ -198,7 +216,8 @@ class SuperMimicRunner:
         self.algorithm.critic.train()
         warmup_steps = max(int(self.algorithm_cfg["warmup_steps"]), self.algorithm.world_model_window)
         stats = {name: [] for name in (
-            "sim_reward", "episode_length", "normalized_return", "termination_count", "done_count"
+            "sim_reward", "episode_length", "normalized_return", "termination_count", "done_count",
+            "recovery_ratio",
         )}
         print(f"[INFO] Filling SuperMimic replay with {warmup_steps} simulator steps.")
         self._collect(warmup_steps, stats)
@@ -207,6 +226,7 @@ class SuperMimicRunner:
         aggregate = {name: [] for name in (
             "world_model_loss", "world_model_error_8", "policy_loss", "critic_loss",
             "imagined_reward", "policy_gradient_norm", "imagined_survival",
+            "replay_recovery_ratio", "imagined_recovery_ratio",
         )}
         start_time = time.time() - self.wall_time_offset
         interval_start = time.time()
