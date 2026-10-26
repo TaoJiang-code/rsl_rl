@@ -7,11 +7,13 @@ from rsl_rl.algorithms.supermimic.buffer import ReplayBuffer
 from rsl_rl.algorithms.supermimic.kinematics import UrdfKinematics
 from rsl_rl.algorithms.supermimic.mdp import (
     G1_ROBOT_SPEC,
+    RewardConfig,
     SuperMimicMDP,
     SuperMimicRobotSpec,
     flatten_state,
     unflatten_state,
 )
+from rsl_rl.algorithms.supermimic.networks import WorldModel
 from rsl_rl.algorithms.supermimic.rotations import so3_exp, so3_log
 
 
@@ -61,6 +63,7 @@ def test_replay_window_masks_episode_boundaries():
         })
     sample = replay.sample_windows(64, 4)
     assert sample["s"].shape == (64, 4, 71)
+    assert sample["a_prev"].shape == (64, 4, 29)
     assert sample["mask"].shape == (64, 4)
     assert torch.all((sample["mask"] == 0) | (sample["mask"] == 1))
 
@@ -126,6 +129,79 @@ def test_full_physics_context_spec_and_recovery_expiry():
     updated = mdp.advance_context(context, torch.tensor([149, 150, 20]), 150)
     torch.testing.assert_close(updated[:, 0], torch.tensor([80.0, 0.0, 0.0]))
     torch.testing.assert_close(updated[:, 1], torch.tensor([1.0, 0.0, 0.0]))
+
+
+def test_delayed_actuator_spec_and_world_model_inputs_include_previous_action():
+    spec = SuperMimicRobotSpec(
+        num_joints=2,
+        num_tracked_bodies=1,
+        context_dim_override=11,
+        actuator_delay_groups=("legs", "arms"),
+    )
+    assert spec.uses_action_history
+    assert SuperMimicRobotSpec.from_dict(spec.to_dict()) == spec
+
+    model = WorldModel.__new__(WorldModel)
+    torch.nn.Module.__init__(model)
+    model.uses_action_history = True
+    state = (
+        torch.zeros(3, 3),
+        torch.eye(3).expand(3, -1, -1),
+        torch.zeros(3, 3),
+        torch.zeros(3, 3),
+        torch.zeros(3, 2),
+        torch.zeros(3, 2),
+    )
+    previous_action = torch.full((3, 2), -1.0)
+    action = torch.full((3, 2), 1.0)
+    context = torch.zeros(3, 11)
+    inputs = model.inputs(state, action, context, previous_action)
+    assert inputs.shape == (3, spec.invariant_dim + 4 + spec.context_dim)
+    torch.testing.assert_close(
+        inputs[:, spec.invariant_dim : spec.invariant_dim + 2], previous_action
+    )
+    torch.testing.assert_close(
+        inputs[:, spec.invariant_dim + 2 : spec.invariant_dim + 4], action
+    )
+
+
+def test_soft_termination_includes_end_effector_height_and_recovery_mask():
+    class StubKinematics:
+        def forward(self, p, rotation, v, w, q, qd):
+            del p, rotation, v, w, q, qd
+            body_position = torch.zeros(3, 3, 3)
+            body_position[1:, 1, 2] = 0.2
+            return body_position, None, None, None
+
+    mdp = SuperMimicMDP.__new__(SuperMimicMDP)
+    mdp.kinematics = StubKinematics()
+    mdp.motion = SimpleNamespace(
+        body_pos_w=torch.zeros(1, 3, 3),
+        body_quat_w=torch.tensor([[[1.0, 0.0, 0.0, 0.0]] * 3]),
+    )
+    mdp.cfg = RewardConfig(termination_body_height=0.12)
+    mdp.end_effector_body_ids = (1, 2)
+    mdp.context_layout = SimpleNamespace(recovery_active=slice(0, 1))
+    state = (
+        torch.zeros(3, 3),
+        torch.eye(3).expand(3, -1, -1),
+        torch.zeros(3, 3),
+        torch.zeros(3, 3),
+        torch.zeros(3, 1),
+        torch.zeros(3, 1),
+    )
+    context = torch.tensor([[0.0], [0.0], [1.0]])
+    failure, terms = mdp.soft_termination(
+        state,
+        torch.zeros(3, dtype=torch.long),
+        context,
+        return_terms=True,
+    )
+    assert failure[0] < 0.01
+    assert failure[1] > 0.95
+    assert failure[2] == 0.0
+    assert terms["end_effector"][1] > 0.95
+    assert terms["end_effector"][2] == 0.0
 
 
 def test_urdf_fk_shapes_and_joint_mapping():

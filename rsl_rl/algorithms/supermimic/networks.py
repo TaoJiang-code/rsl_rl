@@ -65,7 +65,9 @@ class WorldModel(nn.Module):
     def __init__(self, robot_spec: SuperMimicRobotSpec):
         super().__init__()
         self.num_joints = robot_spec.num_joints
-        self.input_dim = robot_spec.invariant_dim + self.num_joints + robot_spec.context_dim
+        self.uses_action_history = robot_spec.uses_action_history
+        action_dim = self.num_joints * (2 if self.uses_action_history else 1)
+        self.input_dim = robot_spec.invariant_dim + action_dim + robot_spec.context_dim
         self.net = mlp(
             self.input_dim,
             [2048, 2048, 2048],
@@ -78,8 +80,14 @@ class WorldModel(nn.Module):
         self.in_norm = RunningNorm(self.input_dim)
         self.out_norm = RunningNorm(robot_spec.state_increment_dim, eps=1e-4)
 
-    def inputs(self, state, action, normalized_context):
-        return torch.cat((invariant_features(state), action, normalized_context), -1)
+    def inputs(self, state, action, normalized_context, previous_action=None):
+        values = [invariant_features(state)]
+        if self.uses_action_history:
+            if previous_action is None:
+                raise ValueError("Delayed-actuator world model requires previous_action.")
+            values.append(previous_action)
+        values.extend((action, normalized_context))
+        return torch.cat(values, -1)
 
     @staticmethod
     def targets(state, next_state):
@@ -99,9 +107,12 @@ class WorldModel(nn.Module):
             -1,
         )
 
-    def step(self, state, action, normalized_context):
+    def step(self, state, action, normalized_context, previous_action=None):
         p, rotation, v, w, q, qd = state
-        output = run_mlp(self.net, self.in_norm(self.inputs(state, action, normalized_context)))
+        output = run_mlp(
+            self.net,
+            self.in_norm(self.inputs(state, action, normalized_context, previous_action)),
+        )
         delta = output * self.out_norm.std() + self.out_norm.mean
         dp, dtheta, dv, dw, dq, dqd = delta.split(
             (3, 3, 3, 3, self.num_joints, self.num_joints), -1

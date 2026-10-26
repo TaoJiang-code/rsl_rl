@@ -12,6 +12,7 @@ import torch
 from rsl_rl.algorithms.supermimic.algorithm import SuperMimicAlgorithm
 from rsl_rl.algorithms.supermimic.kinematics import UrdfKinematics
 from rsl_rl.algorithms.supermimic.mdp import (
+    RewardConfig,
     SuperMimicMDP,
     SuperMimicRobotSpec,
     unflatten_state,
@@ -39,10 +40,15 @@ class SuperMimicRunner:
         self.motion = self.unwrapped.command_manager.get_term("motion")
         self.action_term = self.unwrapped.action_manager.get_term("joint_pos")
         initial_context = self.unwrapped.refresh_supermimic_context()
+        context_layout = self.unwrapped.supermimic_context_layout
+        actuator_delay_groups = (
+            () if context_layout is None else context_layout.actuator_delay_names
+        )
         self.robot_spec = SuperMimicRobotSpec(
             num_joints=len(self.motion.cfg.joint_names),
             num_tracked_bodies=len(self.motion.cfg.tracked_body_names),
             context_dim_override=initial_context.shape[-1],
+            actuator_delay_groups=actuator_delay_groups,
         )
         if self.action_term.action_dim != self.robot_spec.num_joints:
             raise ValueError(
@@ -62,6 +68,20 @@ class SuperMimicRunner:
         )
         default_joint_position = robot.data.default_joint_pos[0].to(device)
         soft_limits = robot.data.soft_joint_pos_limits[0].to(device)
+        tracking_failure_cfg = self.unwrapped.cfg.terminations.tracking_failure
+        end_effector_cfg = getattr(self.unwrapped.cfg.terminations, "ee_body_pos", None)
+        end_effector_body_names = (
+            () if end_effector_cfg is None else tuple(end_effector_cfg.params["body_names"])
+        )
+        reward_cfg = RewardConfig(
+            termination_height=float(tracking_failure_cfg.params["height_threshold"]),
+            termination_tilt=float(tracking_failure_cfg.params["tilt_threshold"]),
+            termination_body_height=(
+                0.25
+                if end_effector_cfg is None
+                else float(end_effector_cfg.params["threshold"])
+            ),
+        )
         self.mdp = SuperMimicMDP(
             kinematics,
             self.motion,
@@ -69,6 +89,8 @@ class SuperMimicRunner:
             soft_limits,
             self.robot_spec,
             context_layout=self.unwrapped.supermimic_context_layout,
+            end_effector_body_names=end_effector_body_names,
+            cfg=reward_cfg,
         )
         self.algorithm_cfg["recovery_window_steps"] = max(
             1, int(round(float(self.motion.cfg.recovery_window_s) / self.unwrapped.step_dt))
@@ -82,6 +104,11 @@ class SuperMimicRunner:
         )
         print(f"[INFO] SuperMimic robot spec: {self.robot_spec.to_dict()}")
         print(f"[INFO] SuperMimic physics context dimension: {self.robot_spec.context_dim}")
+        if actuator_delay_groups:
+            print(
+                "[INFO] SuperMimic delayed actuator groups: "
+                f"{', '.join(actuator_delay_groups)}; world model uses previous_action."
+            )
         self.writer = None
         self._csv_file = None
         self._csv_writer = None
@@ -139,6 +166,15 @@ class SuperMimicRunner:
                 if layout is None
                 else float(context[..., layout.recovery_active].float().mean())
             )
+            statistics["sampling_entropy"].append(
+                float(self.motion.metrics["sampling_entropy"].mean())
+            )
+            statistics["sampling_top1_probability"].append(
+                float(self.motion.metrics["sampling_top1_probability"].mean())
+            )
+            statistics["sampling_active_failure_bins"].append(
+                float((self.motion.bin_failed_count > 0.0).float().mean())
+            )
             if done.any():
                 ids = done.bool().nonzero(as_tuple=False).squeeze(-1)
                 statistics["episode_length"].append(float((episode_step[ids] + 1).float().mean()))
@@ -164,6 +200,8 @@ class SuperMimicRunner:
             "imagined_survival", "sim_reward", "episode_length", "normalized_return",
             "real_recovery_ratio", "replay_recovery_ratio", "imagined_recovery_ratio",
             "valid_imagined_start_ratio", "recovery_assist_anneal", "termination_fraction",
+            "soft_termination_height", "soft_termination_tilt", "soft_termination_end_effector",
+            "sampling_entropy", "sampling_top1_probability", "sampling_active_failure_bins",
             "iterations_per_second", "learning_rate",
         ]
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=columns)
@@ -188,7 +226,15 @@ class SuperMimicRunner:
             "replay_recovery_ratio": self._mean(aggregate["replay_recovery_ratio"]),
             "imagined_recovery_ratio": self._mean(aggregate["imagined_recovery_ratio"]),
             "valid_imagined_start_ratio": self._mean(aggregate["valid_imagined_start_ratio"]),
+            "soft_termination_height": self._mean(aggregate["soft_termination_height"]),
+            "soft_termination_tilt": self._mean(aggregate["soft_termination_tilt"]),
+            "soft_termination_end_effector": self._mean(
+                aggregate["soft_termination_end_effector"]
+            ),
             "recovery_assist_anneal": float(self.motion.recovery_assist_anneal),
+            "sampling_entropy": self._mean(stats["sampling_entropy"]),
+            "sampling_top1_probability": self._mean(stats["sampling_top1_probability"]),
+            "sampling_active_failure_bins": self._mean(stats["sampling_active_failure_bins"]),
             "sim_reward": self._mean(stats["sim_reward"]),
             "episode_length": self._mean(stats["episode_length"]),
             "normalized_return": self._mean(stats["normalized_return"]),
@@ -219,7 +265,8 @@ class SuperMimicRunner:
         warmup_steps = max(int(self.algorithm_cfg["warmup_steps"]), self.algorithm.world_model_window)
         stats = {name: [] for name in (
             "sim_reward", "episode_length", "normalized_return", "termination_count", "done_count",
-            "recovery_ratio",
+            "recovery_ratio", "sampling_entropy", "sampling_top1_probability",
+            "sampling_active_failure_bins",
         )}
         print(f"[INFO] Filling SuperMimic replay with {warmup_steps} simulator steps.")
         self._collect(warmup_steps, stats)
@@ -229,6 +276,8 @@ class SuperMimicRunner:
             "world_model_loss", "world_model_error_8", "policy_loss", "critic_loss",
             "imagined_reward", "policy_gradient_norm", "imagined_survival",
             "replay_recovery_ratio", "imagined_recovery_ratio", "valid_imagined_start_ratio",
+            "soft_termination_height", "soft_termination_tilt",
+            "soft_termination_end_effector",
         )}
         start_time = time.time() - self.wall_time_offset
         interval_start = time.time()

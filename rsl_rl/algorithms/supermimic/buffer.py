@@ -53,7 +53,10 @@ class ReplayBuffer:
         ages = first[:, None] + torch.arange(window, device=self.device)
         rows = self._row(ages)
         envs = env[:, None].expand_as(rows)
-        output = {name: self.data[name][rows, envs] for name in ("s", "s1", "a", "xi", "done")}
+        output = {
+            name: self.data[name][rows, envs]
+            for name in ("s", "s1", "a", "a_prev", "xi", "done")
+        }
         done = output["done"].float()
         output["mask"] = torch.cumprod(
             torch.cat((torch.ones(batch_size, 1, device=self.device), 1 - done[:, :-1]), -1), -1

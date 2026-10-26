@@ -18,6 +18,7 @@ class SuperMimicRobotSpec:
     num_joints: int
     num_tracked_bodies: int
     context_dim_override: int | None = None
+    actuator_delay_groups: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.num_joints <= 0:
@@ -40,6 +41,10 @@ class SuperMimicRobotSpec:
         return 4 + self.num_joints if self.context_dim_override is None else self.context_dim_override
 
     @property
+    def uses_action_history(self) -> bool:
+        return bool(self.actuator_delay_groups)
+
+    @property
     def goal_step_dim(self) -> int:
         return 15 + 2 * self.num_joints
 
@@ -58,23 +63,26 @@ class SuperMimicRobotSpec:
     def goal_dim(self, goal_frames: int) -> int:
         return self.goal_step_dim * goal_frames
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, int | list[str]]:
         value = {
             "num_joints": self.num_joints,
             "num_tracked_bodies": self.num_tracked_bodies,
         }
         if self.context_dim_override is not None and self.context_dim_override != 4 + self.num_joints:
             value["context_dim"] = self.context_dim_override
+        if self.actuator_delay_groups:
+            value["actuator_delay_groups"] = list(self.actuator_delay_groups)
         return value
 
     @classmethod
-    def from_dict(cls, value: dict[str, int]) -> "SuperMimicRobotSpec":
+    def from_dict(cls, value: dict[str, int | list[str]]) -> "SuperMimicRobotSpec":
         return cls(
             num_joints=int(value["num_joints"]),
             num_tracked_bodies=int(value["num_tracked_bodies"]),
             context_dim_override=(
                 int(value["context_dim"]) if "context_dim" in value else None
             ),
+            actuator_delay_groups=tuple(value.get("actuator_delay_groups", ())),
         )
 
 
@@ -154,6 +162,7 @@ class RewardConfig:
     joint_limit_weight: float = -2.0
     termination_height: float = 0.25
     termination_tilt: float = 0.8
+    termination_body_height: float = 0.25
 
 
 class SuperMimicMDP:
@@ -165,6 +174,7 @@ class SuperMimicMDP:
         soft_limits,
         robot_spec: SuperMimicRobotSpec,
         context_layout=None,
+        end_effector_body_names: tuple[str, ...] = (),
         cfg=RewardConfig(),
     ):
         self.kinematics = kinematics
@@ -175,6 +185,13 @@ class SuperMimicMDP:
         self.soft_lower = soft_limits[..., 0]
         self.soft_upper = soft_limits[..., 1]
         self.cfg = cfg
+        tracked_body_names = tuple(motion.cfg.tracked_body_names)
+        missing = set(end_effector_body_names).difference(tracked_body_names)
+        if missing:
+            raise ValueError(f"SuperMimic termination bodies are not tracked: {sorted(missing)}.")
+        self.end_effector_body_ids = tuple(
+            tracked_body_names.index(name) for name in end_effector_body_names
+        )
         device = default_joint_position.device
         self.obs_noise = torch.cat(
             (
@@ -285,20 +302,45 @@ class SuperMimicMDP:
         context: torch.Tensor | None = None,
         height_temperature=0.02,
         tilt_temperature=0.04,
+        return_terms: bool = False,
     ):
-        p, rotation = state[0], state[1]
+        p, rotation, v, w, q, qd = state
         reference_p = self.motion.body_pos_w[frame, 0]
         reference_r = quat_to_mat(self.motion.body_quat_w[frame, 0])
         height_error = (reference_p[..., 2] - p[..., 2]).abs()
         tilt_error = (reference_r[..., 2, 2] - rotation[..., 2, 2]).abs()
-        alive = (1 - torch.sigmoid((height_error - self.cfg.termination_height) / height_temperature)) * (
-            1 - torch.sigmoid((tilt_error - self.cfg.termination_tilt) / tilt_temperature)
+        height_failure = torch.sigmoid(
+            (height_error - self.cfg.termination_height) / height_temperature
         )
-        failure = 1 - alive
+        tilt_failure = torch.sigmoid(
+            (tilt_error - self.cfg.termination_tilt) / tilt_temperature
+        )
+        failure = 1.0 - (1.0 - height_failure) * (1.0 - tilt_failure)
+        body_failure = torch.zeros_like(failure)
+        if self.end_effector_body_ids:
+            body_p = self.kinematics.forward(p, rotation, v, w, q, qd)[0]
+            reference_body_p = self.motion.body_pos_w[frame]
+            body_height_error = (
+                reference_body_p[..., self.end_effector_body_ids, 2]
+                - body_p[..., self.end_effector_body_ids, 2]
+            ).abs().amax(-1)
+            body_failure = torch.sigmoid(
+                (body_height_error - self.cfg.termination_body_height) / height_temperature
+            )
+            failure = 1.0 - (1.0 - failure) * (1.0 - body_failure)
+
+        enabled = torch.ones_like(failure)
         if context is not None and self.context_layout is not None:
             recovery_active = context[..., self.context_layout.recovery_active].squeeze(-1)
-            failure = failure * (1.0 - recovery_active)
-        return failure
+            enabled = 1.0 - recovery_active
+            failure = failure * enabled
+        if not return_terms:
+            return failure
+        return failure, {
+            "height": height_failure * enabled,
+            "tilt": tilt_failure * enabled,
+            "end_effector": body_failure * enabled,
+        }
 
     def critic_features(self, state, frame, normalized_context):
         p, rotation, v, w, q, qd = state

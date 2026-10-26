@@ -106,7 +106,14 @@ class SuperMimicAlgorithm:
         if self.context_norm is not None:
             self.context_norm.update(transition["xi"])
         context = self._normalize_context(transition["xi"])
-        self.world_model.in_norm.update(self.world_model.inputs(state, transition["a"], context))
+        self.world_model.in_norm.update(
+            self.world_model.inputs(
+                state,
+                transition["a"],
+                context,
+                transition["a_prev"],
+            )
+        )
         self.world_model.out_norm.update(self.world_model.targets(state, next_state))
 
     def _normalize_context(self, context: torch.Tensor) -> torch.Tensor:
@@ -114,7 +121,7 @@ class SuperMimicAlgorithm:
             return self.context_norm(context)
         return normalize_context(context)
 
-    def _world_model_rollout(self, state, action, context):
+    def _world_model_rollout(self, state, action, previous_action, context):
         state = unflatten_state(state[:, 0])
         predictions = []
         for step in range(self.world_model_window):
@@ -122,6 +129,7 @@ class SuperMimicAlgorithm:
                 state,
                 action[:, step],
                 self._normalize_context(context[:, step]),
+                previous_action[:, step],
             )
             predictions.append(state)
         predicted = tuple(torch.stack([value[index] for value in predictions], 1) for index in range(6))
@@ -137,7 +145,9 @@ class SuperMimicAlgorithm:
         batch_size = int(self.cfg["world_model_batch_size"])
         window = self.world_model_window
         sample = self.replay.sample_windows(batch_size, window)
-        predicted = self.world_model_rollout(sample["s"], sample["a"], sample["xi"])
+        predicted = self.world_model_rollout(
+            sample["s"], sample["a"], sample["a_prev"], sample["xi"]
+        )
         loss, last_errors = self.world_model_error(predicted, sample["s1"], sample["mask"])
         self.world_model_optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -195,9 +205,18 @@ class SuperMimicAlgorithm:
     def _critic_input(self, state, frame, normalized_context, goal):
         return torch.cat((self.mdp.critic_features(state, frame, normalized_context), goal), -1)
 
-    def _imagination_step(self, state, observation_history, frame, context, normalized_context, goal):
+    def _imagination_step(
+        self,
+        state,
+        observation_history,
+        frame,
+        context,
+        normalized_context,
+        goal,
+        previous_action,
+    ):
         action = self.policy(observation_history, goal)
-        next_state = self.world_model.step(state, action, normalized_context)
+        next_state = self.world_model.step(state, action, normalized_context, previous_action)
         next_frame = frame + 1
         observation = self.mdp.add_noise(self.mdp.observation(next_state, action, context, next_frame))
         next_history = torch.cat((observation_history[:, 1:], observation[:, None]), 1)
@@ -205,10 +224,10 @@ class SuperMimicAlgorithm:
         return next_state, action, next_history, next_frame, next_goal
 
     def _reward_termination(self, state, frame, action, previous_action, context):
-        return (
-            self.mdp.reward(state, frame, action, previous_action),
-            self.mdp.soft_termination(state, frame, context),
+        termination, terms = self.mdp.soft_termination(
+            state, frame, context, return_terms=True
         )
+        return self.mdp.reward(state, frame, action, previous_action), termination, terms
 
     def policy_update(self) -> dict[str, torch.Tensor]:
         batch_size = int(self.cfg["policy_batch_size"])
@@ -235,7 +254,13 @@ class SuperMimicAlgorithm:
         for _ in range(self.horizon):
             previous_actions.append(previous_action)
             state, previous_action, observation_history, frame, goal = self.imagination_step(
-                state, observation_history, frame, context, normalized_context, goal
+                state,
+                observation_history,
+                frame,
+                context,
+                normalized_context,
+                goal,
+                previous_action,
             )
             states.append(state)
             actions.append(previous_action)
@@ -252,7 +277,7 @@ class SuperMimicAlgorithm:
 
         flatten = lambda values: torch.stack(values).flatten(0, 1)  # noqa: E731
         all_states = tuple(flatten([state_at_time[index] for state_at_time in states]) for index in range(6))
-        rewards, terminations = self.reward_termination(
+        rewards, terminations, termination_terms = self.reward_termination(
             all_states,
             flatten(frames),
             flatten(actions),
@@ -343,6 +368,11 @@ class SuperMimicAlgorithm:
             zero = torch.zeros((), device=self.device)
             result["replay_recovery_ratio"] = zero
             result["imagined_recovery_ratio"] = zero
+        result["soft_termination_height"] = termination_terms["height"].mean().detach()
+        result["soft_termination_tilt"] = termination_terms["tilt"].mean().detach()
+        result["soft_termination_end_effector"] = (
+            termination_terms["end_effector"].mean().detach()
+        )
         return result
 
     def state_dict(self) -> dict:
