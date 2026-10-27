@@ -212,6 +212,42 @@ def test_soft_termination_includes_end_effector_height_and_recovery_mask():
     assert terms["end_effector"][2] == 0.0
 
 
+def test_reward_applies_soft_termination_penalty_with_control_dt():
+    class StubKinematics:
+        def forward(self, p, rotation, v, w, q, qd):
+            del q, qd
+            return p[:, None], rotation[:, None], v[:, None], w[:, None]
+
+    mdp = SuperMimicMDP.__new__(SuperMimicMDP)
+    mdp.kinematics = StubKinematics()
+    mdp.motion = SimpleNamespace(
+        body_pos_w=torch.zeros(1, 1, 3),
+        body_quat_w=torch.tensor([[[1.0, 0.0, 0.0, 0.0]]]),
+        body_lin_vel_w=torch.zeros(1, 1, 3),
+        body_ang_vel_w=torch.zeros(1, 1, 3),
+    )
+    mdp.soft_lower = torch.full((1,), -1.0)
+    mdp.soft_upper = torch.full((1,), 1.0)
+    mdp.cfg = RewardConfig(termination_penalty_weight=-1.0)
+    state = (
+        torch.zeros(2, 3),
+        torch.eye(3).expand(2, -1, -1),
+        torch.zeros(2, 3),
+        torch.zeros(2, 3),
+        torch.zeros(2, 1),
+        torch.zeros(2, 1),
+    )
+    action = torch.zeros(2, 1)
+    reward = mdp.reward(
+        state,
+        torch.zeros(2, dtype=torch.long),
+        action,
+        action,
+        termination=torch.tensor([0.0, 1.0]),
+    )
+    torch.testing.assert_close(reward[0] - reward[1], torch.tensor(0.02))
+
+
 def test_urdf_fk_shapes_and_joint_mapping():
     root = Path(__file__).resolve().parents[3]
     urdf = root / "Glush_Zoo/g1_description/urdf/g1_29dof_rev_1_0.urdf"

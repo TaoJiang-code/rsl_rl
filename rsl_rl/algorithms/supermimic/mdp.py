@@ -160,6 +160,7 @@ class RewardConfig:
     root_orientation_std: float = 0.4
     action_rate_weight: float = -0.1
     joint_limit_weight: float = -2.0
+    termination_penalty_weight: float = 0.0
     termination_height: float = 0.25
     termination_tilt: float = 0.8
     termination_body_height: float = 0.25
@@ -236,7 +237,15 @@ class SuperMimicMDP:
     def add_noise(self, observation: torch.Tensor) -> torch.Tensor:
         return observation + (2 * torch.rand_like(observation) - 1) * self.obs_noise
 
-    def reward(self, state, frame, action, previous_action, return_terms: bool = False):
+    def reward(
+        self,
+        state,
+        frame,
+        action,
+        previous_action,
+        return_terms: bool = False,
+        termination: torch.Tensor | None = None,
+    ):
         cfg = self.cfg
         p, rotation, v, w, q, qd = state
         body_p, body_r, body_v, body_w = self.kinematics.forward(p, rotation, v, w, q, qd)
@@ -265,8 +274,14 @@ class SuperMimicMDP:
         )
         action_rate = (action - previous_action).square().sum(-1)
         joint_limit = (torch.relu(q - self.soft_upper) + torch.relu(self.soft_lower - q)).sum(-1)
+        termination_penalty = (
+            torch.zeros_like(action_rate) if termination is None else termination
+        )
         reward = (
-            tracking + cfg.action_rate_weight * action_rate + cfg.joint_limit_weight * joint_limit
+            tracking
+            + cfg.action_rate_weight * action_rate
+            + cfg.joint_limit_weight * joint_limit
+            + cfg.termination_penalty_weight * termination_penalty
         ) * CONTROL_DT
         if return_terms:
             return reward, {
@@ -276,6 +291,7 @@ class SuperMimicMDP:
                 "root_position_error": root_position_error,
                 "action_rate": action_rate,
                 "joint_limit": joint_limit,
+                "termination_penalty": termination_penalty,
             }
         return reward
 

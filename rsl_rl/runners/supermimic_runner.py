@@ -73,7 +73,15 @@ class SuperMimicRunner:
         end_effector_body_names = (
             () if end_effector_cfg is None else tuple(end_effector_cfg.params["body_names"])
         )
+        termination_penalty_cfg = getattr(
+            self.unwrapped.cfg.rewards, "termination_penalty", None
+        )
         reward_cfg = RewardConfig(
+            termination_penalty_weight=(
+                0.0
+                if termination_penalty_cfg is None
+                else float(termination_penalty_cfg.weight)
+            ),
             termination_height=float(tracking_failure_cfg.params["height_threshold"]),
             termination_tilt=float(tracking_failure_cfg.params["tilt_threshold"]),
             termination_body_height=(

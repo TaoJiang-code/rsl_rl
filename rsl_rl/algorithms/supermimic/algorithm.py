@@ -227,7 +227,17 @@ class SuperMimicAlgorithm:
         termination, terms = self.mdp.soft_termination(
             state, frame, context, return_terms=True
         )
-        return self.mdp.reward(state, frame, action, previous_action), termination, terms
+        return (
+            self.mdp.reward(
+                state,
+                frame,
+                action,
+                previous_action,
+                termination=termination,
+            ),
+            termination,
+            terms,
+        )
 
     def policy_update(self) -> dict[str, torch.Tensor]:
         batch_size = int(self.cfg["policy_batch_size"])
