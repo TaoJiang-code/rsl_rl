@@ -288,6 +288,10 @@ class SuperMimicMDP:
         if self.context_layout is None:
             return context
         updated = context.clone()
+        push_velocity = getattr(self.context_layout, "push_velocity", None)
+        if push_velocity is not None:
+            # A velocity impulse is instantaneous. It affects only the transition carrying it.
+            updated[..., push_velocity] = 0.0
         was_active = context[..., self.context_layout.recovery_active].squeeze(-1) > 0.5
         active = was_active & (episode_step < recovery_window_steps)
         updated[..., self.context_layout.recovery_active] = active[..., None].to(context.dtype)

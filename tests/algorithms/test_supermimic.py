@@ -122,13 +122,21 @@ def test_full_physics_context_spec_and_recovery_expiry():
 
     mdp = SuperMimicMDP.__new__(SuperMimicMDP)
     mdp.context_layout = SimpleNamespace(
-        recovery_assist=slice(0, 1),
-        recovery_active=slice(1, 2),
+        push_velocity=slice(0, 6),
+        recovery_assist=slice(6, 7),
+        recovery_active=slice(7, 8),
     )
-    context = torch.tensor([[80.0, 1.0], [50.0, 1.0], [0.0, 0.0]])
+    context = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 80.0, 1.0],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 50.0, 1.0],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0],
+        ]
+    )
     updated = mdp.advance_context(context, torch.tensor([149, 150, 20]), 150)
-    torch.testing.assert_close(updated[:, 0], torch.tensor([80.0, 0.0, 0.0]))
-    torch.testing.assert_close(updated[:, 1], torch.tensor([1.0, 0.0, 0.0]))
+    torch.testing.assert_close(updated[:, :6], torch.zeros(3, 6))
+    torch.testing.assert_close(updated[:, 6], torch.tensor([80.0, 0.0, 0.0]))
+    torch.testing.assert_close(updated[:, 7], torch.tensor([1.0, 0.0, 0.0]))
 
 
 def test_delayed_actuator_spec_and_world_model_inputs_include_previous_action():

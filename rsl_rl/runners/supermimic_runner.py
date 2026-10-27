@@ -143,6 +143,9 @@ class SuperMimicRunner:
             transition_info = extras.get("supermimic")
             if transition_info is None:
                 raise RuntimeError("SuperMimic environment did not expose its pre-reset transition state.")
+            layout = self.unwrapped.supermimic_context_layout
+            if layout is not None:
+                context[:, layout.push_velocity] = transition_info["push_velocity"]
             terminated = transition_info["terminated"].bool()
             time_outs = transition_info["time_outs"].bool()
             transition = {
@@ -160,7 +163,6 @@ class SuperMimicRunner:
             self.algorithm.update_normalizers(transition, observation, goal)
             self.sim_steps += self.env.num_envs
             statistics["sim_reward"].append(float(reward.mean() / 0.1))
-            layout = self.unwrapped.supermimic_context_layout
             statistics["recovery_ratio"].append(
                 0.0
                 if layout is None
