@@ -67,6 +67,7 @@ class SuperMimicRunner:
                     f"algorithm expects {expected_count}."
                 )
             self.teleop_task = ~motion_task
+            self.algorithm_cfg["motion_env_count"] = int(motion_task.sum())
             self.velocity_term = self.unwrapped.command_manager.get_term(
                 self.velocity_command_name
             )
@@ -370,6 +371,12 @@ class SuperMimicRunner:
             "sampling_entropy", "sampling_top1_probability", "sampling_active_failure_bins",
             "iterations_per_second", "learning_rate",
         ]
+        if self.mixed_tasks:
+            columns[5:5] = [
+                "training_stage", "velocity_warmup_completed",
+                "motion_policy_loss", "teleop_policy_loss",
+                "alignment_loss", "motion_critic_loss", "velocity_critic_loss",
+            ]
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=columns)
         if not exists:
             self._csv_writer.writeheader()
@@ -412,14 +419,37 @@ class SuperMimicRunner:
             "iterations_per_second": int(self.algorithm_cfg["log_interval"]) / interval_elapsed,
             "learning_rate": learning_rate,
         }
+        if self.mixed_tasks:
+            row.update(
+                {
+                    "training_stage": self.algorithm.training_stage,
+                    "velocity_warmup_completed": self.algorithm.velocity_warmup_completed,
+                    "motion_policy_loss": self._mean(aggregate["motion_policy_loss"]),
+                    "teleop_policy_loss": self._mean(aggregate["teleop_policy_loss"]),
+                    "alignment_loss": self._mean(aggregate["alignment_loss"]),
+                    "motion_critic_loss": self._mean(aggregate["motion_critic_loss"]),
+                    "velocity_critic_loss": self._mean(
+                        aggregate["velocity_critic_loss"]
+                    ),
+                }
+            )
         self._csv_writer.writerow(row)
         self._csv_file.flush()
         for name, value in row.items():
-            if name not in ("iteration", "wall_h", "sim_steps"):
+            if name not in ("iteration", "wall_h", "sim_steps", "training_stage"):
                 self.writer.add_scalar(f"SuperMimic/{name}", value, iteration)
+        stage_text = (
+            f"{row['training_stage']} "
+            f"{row['velocity_warmup_completed']}/"
+            f"{int(self.algorithm_cfg.get('velocity_warmup_updates', 0))} "
+            f"align {row['alignment_loss']:.4f} "
+            if self.mixed_tasks
+            else ""
+        )
         print(
             f"it {iteration} | {row['wall_h']:.3f} h | wm {row['world_model_loss']:.4f} "
-            f"e8 {row['world_model_error_8']:.4f} | pi {row['policy_loss']:.3f} "
+            f"e8 {row['world_model_error_8']:.4f} | {stage_text}"
+            f"pi {row['policy_loss']:.3f} "
             f"v {row['critic_loss']:.4f} imag_r {row['imagined_reward']:.3f} "
             f"surv {row['imagined_survival']:.3f} | sim_r {row['sim_reward']:.3f} "
             f"ep_len {row['episode_length']:.1f} ep_ret {row['normalized_return']:.3f} "
@@ -432,6 +462,13 @@ class SuperMimicRunner:
         self.algorithm.world_model.train()
         self.algorithm.policy.train()
         self.algorithm.critic.train()
+        if self.algorithm.velocity_critic is not None:
+            self.algorithm.velocity_critic.train()
+        if self.mixed_tasks and not self.algorithm.motion_initialized:
+            raise RuntimeError(
+                "Mixed SuperMimic training requires a pretrained full-reference checkpoint. "
+                "Pass --motion_checkpoint <model.pt>, or resume an existing mixed run."
+            )
         warmup_steps = max(int(self.algorithm_cfg["warmup_steps"]), self.algorithm.world_model_window)
         stats = {name: [] for name in (
             "sim_reward", "sim_motion_reward", "sim_teleop_reward",
@@ -444,7 +481,9 @@ class SuperMimicRunner:
         self._open_logging(resume=self.current_learning_iteration > 0)
 
         aggregate = {name: [] for name in (
-            "world_model_loss", "world_model_error_8", "policy_loss", "critic_loss",
+            "world_model_loss", "world_model_error_8", "policy_loss",
+            "motion_policy_loss", "teleop_policy_loss", "alignment_loss",
+            "critic_loss", "motion_critic_loss", "velocity_critic_loss",
             "imagined_reward", "imagined_motion_reward", "imagined_teleop_reward",
             "policy_gradient_norm", "imagined_survival",
             "replay_recovery_ratio", "imagined_recovery_ratio", "valid_imagined_start_ratio",
@@ -531,6 +570,16 @@ class SuperMimicRunner:
             f"sim_steps={self.sim_steps}, including the adaptive reset sampler."
         )
         return checkpoint.get("infos")
+
+    def initialize_from_motion_checkpoint(self, path: str, map_location=None) -> None:
+        checkpoint = torch.load(
+            path, weights_only=False, map_location=map_location or "cpu"
+        )
+        self.algorithm.initialize_from_motion_checkpoint(checkpoint)
+        print(
+            "[INFO] Initialized mixed SuperMimic from full-reference checkpoint: "
+            f"{path} (source iteration {int(checkpoint.get('iteration', 0))})."
+        )
 
     def get_inference_policy(self, device: str | None = None):
         self.algorithm.policy.eval()

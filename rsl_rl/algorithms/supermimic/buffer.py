@@ -54,11 +54,19 @@ class ReplayBuffer:
     def _row(self, age: torch.Tensor) -> torch.Tensor:
         return (self.pointer - self.size + age) % self.time_steps
 
-    def sample_windows(self, batch_size: int, window: int) -> dict[str, torch.Tensor]:
+    def sample_windows(
+        self,
+        batch_size: int,
+        window: int,
+        env_range: tuple[int, int] | None = None,
+    ) -> dict[str, torch.Tensor]:
         if self.size < window:
             raise RuntimeError(f"Replay contains {self.size} rows, but a {window}-step window was requested.")
         first = torch.randint(0, self.size - window + 1, (batch_size,), device=self.device)
-        env = torch.randint(0, self.num_envs, (batch_size,), device=self.device)
+        env_low, env_high = (0, self.num_envs) if env_range is None else env_range
+        if not 0 <= env_low < env_high <= self.num_envs:
+            raise ValueError(f"Invalid replay environment range: {(env_low, env_high)}.")
+        env = torch.randint(env_low, env_high, (batch_size,), device=self.device)
         ages = first[:, None] + torch.arange(window, device=self.device)
         rows = self._row(ages)
         envs = env[:, None].expand_as(rows)
@@ -111,6 +119,7 @@ class ReplayBuffer:
         frame_clip_ids: torch.Tensor,
         clip_ends: torch.Tensor,
         horizon: int,
+        teleop_task: bool | None = None,
     ):
         """Sample uniformly from every replay entry that can support a full imagined rollout."""
         if self.size == 0:
@@ -120,17 +129,24 @@ class ReplayBuffer:
         frames = self.data["f"][rows]
         ends = clip_ends[frame_clip_ids[frames]]
         valid_entries = (frames + horizon <= ends).nonzero(as_tuple=False)
+        eligible_count = self.size * self.num_envs
+        if teleop_task is not None:
+            if "teleop_task" not in self.data:
+                raise RuntimeError("Task-filtered replay sampling requires mixed-task metadata.")
+            tasks = self.data["teleop_task"][rows]
+            eligible = tasks == teleop_task
+            valid_entries = ((frames + horizon <= ends) & eligible).nonzero(as_tuple=False)
+            eligible_count = int(eligible.sum())
         valid_count = int(valid_entries.shape[0])
-        total_count = self.size * self.num_envs
         if valid_count == 0:
             remaining = (ends - frames).amax().item()
             raise RuntimeError(
                 "SuperMimic replay has no valid imagined-rollout starts: "
-                f"horizon={horizon}, replay_entries={total_count}, "
+                f"horizon={horizon}, replay_entries={eligible_count}, "
                 f"maximum_remaining_frames={remaining}."
             )
         selected = torch.randint(0, valid_count, (batch_size,), device=self.device)
         entries = valid_entries[selected]
         start, history = self._gather_starts(entries[:, 0], entries[:, 1], history_length)
-        valid_ratio = valid_count / total_count
+        valid_ratio = valid_count / max(eligible_count, 1)
         return start, history, valid_ratio

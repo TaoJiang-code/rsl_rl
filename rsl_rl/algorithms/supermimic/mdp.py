@@ -248,6 +248,15 @@ class SuperMimicMDP:
         ).flatten(-2)
         return torch.cat((velocity_command, joint_reference), dim=-1)
 
+    def reference_velocity_command(self, frame: torch.Tensor) -> torch.Tensor:
+        """Reference planar velocity in its yaw frame plus world yaw rate."""
+        root_rotation = quat_to_mat(self.motion.body_quat_w[frame, 0])
+        heading_t = yaw_mat(root_rotation).transpose(-1, -2)
+        root_velocity = self.motion.body_lin_vel_w[frame, 0]
+        local_velocity = (heading_t @ root_velocity.unsqueeze(-1)).squeeze(-1)
+        yaw_rate = self.motion.body_ang_vel_w[frame, 0, 2:3]
+        return torch.cat((local_velocity[..., :2], yaw_rate), dim=-1)
+
     def observation(self, state, previous_action, context, frame) -> torch.Tensor:
         _, rotation, _, w, q, qd = state
         rotation_t = rotation.transpose(-1, -2)

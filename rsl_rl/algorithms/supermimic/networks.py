@@ -182,21 +182,28 @@ class Policy(nn.Module):
         observation = self.obs_norm(observation_history).flatten(-2)
         return run_mlp(self.decoder, torch.cat((latent, observation), -1))
 
-    def forward(self, observation_history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
-        latent = torch.tanh(run_mlp(self.encoder, self.goal_norm(goal)))
+    def encode_motion(self, goal: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(run_mlp(self.encoder, self.goal_norm(goal)))
+
+    def encode_teleop(self, teleop_goal: torch.Tensor) -> torch.Tensor:
+        if self.teleop_encoder is None or self.teleop_goal_norm is None:
+            raise RuntimeError("This SuperMimic policy has no teleop encoder.")
+        return torch.tanh(
+            run_mlp(self.teleop_encoder, self.teleop_goal_norm(teleop_goal))
+        )
+
+    def decode(self, observation_history: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
         return self._decode(observation_history, latent)
+
+    def forward(self, observation_history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+        return self._decode(observation_history, self.encode_motion(goal))
 
     def forward_teleop(
         self,
         observation_history: torch.Tensor,
         teleop_goal: torch.Tensor,
     ) -> torch.Tensor:
-        if self.teleop_encoder is None or self.teleop_goal_norm is None:
-            raise RuntimeError("This SuperMimic policy has no teleop encoder.")
-        latent = torch.tanh(
-            run_mlp(self.teleop_encoder, self.teleop_goal_norm(teleop_goal))
-        )
-        return self._decode(observation_history, latent)
+        return self._decode(observation_history, self.encode_teleop(teleop_goal))
 
     def forward_mixed(
         self,
@@ -205,12 +212,8 @@ class Policy(nn.Module):
         teleop_goal: torch.Tensor,
         teleop_task: torch.Tensor,
     ) -> torch.Tensor:
-        if self.teleop_encoder is None or self.teleop_goal_norm is None:
-            raise RuntimeError("Mixed SuperMimic inference requires the teleop encoder.")
-        motion_latent = torch.tanh(run_mlp(self.encoder, self.goal_norm(motion_goal)))
-        teleop_latent = torch.tanh(
-            run_mlp(self.teleop_encoder, self.teleop_goal_norm(teleop_goal))
-        )
+        motion_latent = self.encode_motion(motion_goal)
+        teleop_latent = self.encode_teleop(teleop_goal)
         latent = torch.where(teleop_task.bool().unsqueeze(-1), teleop_latent, motion_latent)
         return self._decode(observation_history, latent)
 
