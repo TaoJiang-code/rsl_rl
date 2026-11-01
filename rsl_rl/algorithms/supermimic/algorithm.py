@@ -30,8 +30,13 @@ class SuperMimicAlgorithm:
         self.horizon = int(cfg["imagination_horizon"])
         self.world_model_window = int(cfg["world_model_window"])
         self.base_learning_rate = float(cfg["learning_rate"])
+        self.mixed_tasks = bool(cfg.get("mixed_motion_teleop", False))
         goal_dim = self.robot_spec.goal_dim(self.goal_frames)
-        critic_dim = self.robot_spec.invariant_dim + self.robot_spec.critic_extra_dim + goal_dim
+        teleop_goal_dim = (
+            self.robot_spec.teleop_goal_dim(self.goal_frames) if self.mixed_tasks else None
+        )
+        critic_goal_dim = goal_dim + (1 if self.mixed_tasks else 0)
+        critic_dim = self.robot_spec.invariant_dim + self.robot_spec.critic_extra_dim + critic_goal_dim
 
         networks.AMP_DTYPE = torch.bfloat16 if cfg.get("amp", "bf16") == "bf16" else None
         self.world_model = WorldModel(self.robot_spec).to(device)
@@ -40,6 +45,7 @@ class SuperMimicAlgorithm:
             goal_dim,
             self.robot_spec.num_joints,
             self.history_length,
+            teleop_goal_dim=teleop_goal_dim,
         ).to(device)
         self.critic = Critic(critic_dim).to(device)
         self.context_norm = (
@@ -52,7 +58,13 @@ class SuperMimicAlgorithm:
             self.policy.parameters(), lr=self.base_learning_rate, betas=(0.9, 0.95)
         )
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.base_learning_rate)
-        self.replay = ReplayBuffer(int(cfg["replay_steps"]), num_envs, device, self.robot_spec)
+        self.replay = ReplayBuffer(
+            int(cfg["replay_steps"]),
+            num_envs,
+            device,
+            self.robot_spec,
+            mixed_tasks=self.mixed_tasks,
+        )
         self.error_floor = torch.cat(
             (
                 torch.full((3,), 3e-3),
@@ -81,6 +93,12 @@ class SuperMimicAlgorithm:
             self.imagination_step = torch.compile(self._imagination_step)
             self.reward_termination = torch.compile(self._reward_termination)
             self.critic_input = torch.compile(self._critic_input)
+        if self.mixed_tasks:
+            self.imagination_step = self._mixed_imagination_step
+            self.reward_termination = self._mixed_reward_termination
+            if cfg.get("compile", True):
+                self.imagination_step = torch.compile(self._mixed_imagination_step)
+                self.reward_termination = torch.compile(self._mixed_reward_termination)
 
     def learning_rate(self, iteration: int) -> float:
         decay_iterations = int(self.cfg["learning_rate_decay_iterations"])
@@ -98,9 +116,25 @@ class SuperMimicAlgorithm:
         return learning_rate
 
     @torch.no_grad()
-    def update_normalizers(self, transition: dict[str, torch.Tensor], observation, goal) -> None:
+    def update_normalizers(
+        self,
+        transition: dict[str, torch.Tensor],
+        observation,
+        goal,
+        teleop_goal: torch.Tensor | None = None,
+        teleop_task: torch.Tensor | None = None,
+    ) -> None:
         self.policy.obs_norm.update(observation)
-        self.policy.goal_norm.update(goal)
+        if self.mixed_tasks:
+            if teleop_goal is None or teleop_task is None or self.policy.teleop_goal_norm is None:
+                raise ValueError("Mixed SuperMimic normalizers require teleop goal and task mask.")
+            motion = ~teleop_task.bool()
+            if motion.any():
+                self.policy.goal_norm.update(goal[motion])
+            if teleop_task.any():
+                self.policy.teleop_goal_norm.update(teleop_goal[teleop_task.bool()])
+        else:
+            self.policy.goal_norm.update(goal)
         state = unflatten_state(transition["s"])
         next_state = unflatten_state(transition["s1"])
         if self.context_norm is not None:
@@ -205,6 +239,13 @@ class SuperMimicAlgorithm:
     def _critic_input(self, state, frame, normalized_context, goal):
         return torch.cat((self.mdp.critic_features(state, frame, normalized_context), goal), -1)
 
+    def _mixed_critic_goal(self, motion_goal, teleop_goal, teleop_task):
+        padded_teleop = torch.nn.functional.pad(
+            teleop_goal, (0, motion_goal.shape[-1] - teleop_goal.shape[-1])
+        )
+        selected = torch.where(teleop_task.bool().unsqueeze(-1), padded_teleop, motion_goal)
+        return torch.cat((selected, teleop_task.to(selected.dtype).unsqueeze(-1)), -1)
+
     def _imagination_step(
         self,
         state,
@@ -223,6 +264,63 @@ class SuperMimicAlgorithm:
         next_goal = self.mdp.goal(next_frame, self.goal_frames)
         return next_state, action, next_history, next_frame, next_goal
 
+    def _mixed_imagination_step(
+        self,
+        state,
+        observation_history,
+        frame,
+        context,
+        normalized_context,
+        motion_goal,
+        teleop_goal,
+        velocity_command,
+        velocity_time_left,
+        teleop_task,
+        previous_action,
+    ):
+        action = self.policy.forward_mixed(
+            observation_history, motion_goal, teleop_goal, teleop_task
+        )
+        next_state = self.world_model.step(state, action, normalized_context, previous_action)
+        next_frame = frame + 1
+        observation = self.mdp.add_noise(
+            self.mdp.observation(next_state, action, context, next_frame)
+        )
+        next_history = torch.cat((observation_history[:, 1:], observation[:, None]), 1)
+        next_velocity_command, next_velocity_time_left = self._advance_velocity_command(
+            velocity_command, velocity_time_left
+        )
+        next_motion_goal = self.mdp.goal(next_frame, self.goal_frames)
+        next_teleop_goal = self.mdp.teleop_goal(
+            next_frame, self.goal_frames, next_velocity_command
+        )
+        return (
+            next_state,
+            action,
+            next_history,
+            next_frame,
+            next_motion_goal,
+            next_teleop_goal,
+            next_velocity_command,
+            next_velocity_time_left,
+        )
+
+    def _advance_velocity_command(self, command, time_left):
+        next_time = time_left - float(self.cfg.get("control_dt", 0.02))
+        expired = next_time <= 0.0
+        ranges = command.new_tensor(self.cfg["velocity_command_ranges"])
+        sampled = ranges[:, 0] + torch.rand_like(command) * (ranges[:, 1] - ranges[:, 0])
+        standing = torch.rand_like(time_left) < float(
+            self.cfg["velocity_standing_probability"]
+        )
+        sampled = torch.where(standing[:, None], torch.zeros_like(sampled), sampled)
+        low, high = self.cfg["velocity_resampling_time_range"]
+        sampled_time = float(low) + (float(high) - float(low)) * torch.rand_like(time_left)
+        return (
+            torch.where(expired[:, None], sampled, command),
+            torch.where(expired, sampled_time, next_time),
+        )
+
     def _reward_termination(self, state, frame, action, previous_action, context):
         termination, terms = self.mdp.soft_termination(
             state, frame, context, return_terms=True
@@ -231,6 +329,33 @@ class SuperMimicAlgorithm:
             self.mdp.reward(
                 state,
                 frame,
+                action,
+                previous_action,
+                termination=termination,
+            ),
+            termination,
+            terms,
+        )
+
+    def _mixed_reward_termination(
+        self,
+        state,
+        frame,
+        velocity_command,
+        teleop_task,
+        action,
+        previous_action,
+        context,
+    ):
+        termination, terms = self.mdp.soft_termination(
+            state, frame, context, return_terms=True
+        )
+        return (
+            self.mdp.mixed_reward(
+                state,
+                frame,
+                velocity_command,
+                teleop_task,
                 action,
                 previous_action,
                 termination=termination,
@@ -249,6 +374,9 @@ class SuperMimicAlgorithm:
         frame = start["f"]
         episode_step = start["ep_step"].long()
         previous_action = start["a_prev"]
+        velocity_command = start.get("velocity_command")
+        velocity_time_left = start.get("velocity_time_left")
+        teleop_task = start.get("teleop_task")
         with torch.no_grad():
             observation_history = self.mdp.observation(
                 unflatten_state(history["s"]), history["a_prev"], history["xi"], history["f"]
@@ -259,19 +387,56 @@ class SuperMimicAlgorithm:
         self._requires_grad(self.critic, False)
         initial_goal = self.mdp.goal(frame, self.goal_frames)
         goal = initial_goal
+        initial_teleop_goal = None
+        teleop_goal = None
+        if self.mixed_tasks:
+            if velocity_command is None or velocity_time_left is None or teleop_task is None:
+                raise RuntimeError("Mixed SuperMimic replay is missing task metadata.")
+            initial_teleop_goal = self.mdp.teleop_goal(
+                frame, self.goal_frames, velocity_command
+            )
+            teleop_goal = initial_teleop_goal
         states, actions, previous_actions, frames, goals = [], [], [], [], []
+        teleop_goals = []
+        velocity_commands = []
         contexts = [context]
         for _ in range(self.horizon):
             previous_actions.append(previous_action)
-            state, previous_action, observation_history, frame, goal = self.imagination_step(
-                state,
-                observation_history,
-                frame,
-                context,
-                normalized_context,
-                goal,
-                previous_action,
-            )
+            if self.mixed_tasks:
+                velocity_commands.append(velocity_command)
+                (
+                    state,
+                    previous_action,
+                    observation_history,
+                    frame,
+                    goal,
+                    teleop_goal,
+                    velocity_command,
+                    velocity_time_left,
+                ) = self.imagination_step(
+                    state,
+                    observation_history,
+                    frame,
+                    context,
+                    normalized_context,
+                    goal,
+                    teleop_goal,
+                    velocity_command,
+                    velocity_time_left,
+                    teleop_task,
+                    previous_action,
+                )
+                teleop_goals.append(teleop_goal)
+            else:
+                state, previous_action, observation_history, frame, goal = self.imagination_step(
+                    state,
+                    observation_history,
+                    frame,
+                    context,
+                    normalized_context,
+                    goal,
+                    previous_action,
+                )
             states.append(state)
             actions.append(previous_action)
             frames.append(frame)
@@ -287,13 +452,24 @@ class SuperMimicAlgorithm:
 
         flatten = lambda values: torch.stack(values).flatten(0, 1)  # noqa: E731
         all_states = tuple(flatten([state_at_time[index] for state_at_time in states]) for index in range(6))
-        rewards, terminations, termination_terms = self.reward_termination(
-            all_states,
-            flatten(frames),
-            flatten(actions),
-            flatten(previous_actions),
-            flatten(contexts[1:]),
-        )
+        if self.mixed_tasks:
+            rewards, terminations, termination_terms = self.reward_termination(
+                all_states,
+                flatten(frames),
+                flatten(velocity_commands),
+                teleop_task.repeat(self.horizon),
+                flatten(actions),
+                flatten(previous_actions),
+                flatten(contexts[1:]),
+            )
+        else:
+            rewards, terminations, termination_terms = self.reward_termination(
+                all_states,
+                flatten(frames),
+                flatten(actions),
+                flatten(previous_actions),
+                flatten(contexts[1:]),
+            )
         rewards = rewards.view(self.horizon, batch_size)
         terminations = terminations.view(self.horizon, batch_size)
         alive = torch.cumprod(1 - terminations, 0)
@@ -307,7 +483,18 @@ class SuperMimicAlgorithm:
         if not self.cfg.get("disable_critic", False):
             objective = objective + (
                 float(self.cfg["gamma"]) ** self.horizon
-            ) * final_survival * self.critic(self.critic_input(state, frame, normalized_context, goal))
+            ) * final_survival * self.critic(
+                self.critic_input(
+                    state,
+                    frame,
+                    normalized_context,
+                    (
+                        self._mixed_critic_goal(goal, teleop_goal, teleop_task)
+                        if self.mixed_tasks
+                        else goal
+                    ),
+                )
+            )
         policy_loss = -objective.mean()
         self.policy_optimizer.zero_grad(set_to_none=True)
         policy_loss.backward()
@@ -328,7 +515,21 @@ class SuperMimicAlgorithm:
                     for index in range(6)
                 )
                 critic_frames = torch.cat((start["f"][None], torch.stack(frames)), 0).flatten()
-                critic_goals = torch.cat((initial_goal[None], torch.stack(goals)), 0).flatten(0, 1)
+                if self.mixed_tasks:
+                    motion_goals = torch.cat((initial_goal[None], torch.stack(goals)), 0)
+                    mixed_teleop_goals = torch.cat(
+                        (initial_teleop_goal[None], torch.stack(teleop_goals)), 0
+                    )
+                    task_sequence = teleop_task[None].expand(self.horizon + 1, -1)
+                    critic_goals = self._mixed_critic_goal(
+                        motion_goals.flatten(0, 1),
+                        mixed_teleop_goals.flatten(0, 1),
+                        task_sequence.flatten(),
+                    )
+                else:
+                    critic_goals = torch.cat(
+                        (initial_goal[None], torch.stack(goals)), 0
+                    ).flatten(0, 1)
                 critic_context = self._normalize_context(torch.stack(contexts)).flatten(0, 1)
                 critic_inputs = self.critic_input(
                     critic_states, critic_frames, critic_context, critic_goals
@@ -367,6 +568,18 @@ class SuperMimicAlgorithm:
             "imagined_survival": final_survival.mean().detach(),
             "valid_imagined_start_ratio": self.valid_imagined_start_ratio.detach(),
         }
+        if self.mixed_tasks:
+            motion = ~teleop_task.bool()
+            result["imagined_motion_reward"] = (
+                detached_reward_sum[motion].mean() / self.horizon / 0.1
+                if motion.any()
+                else torch.zeros((), device=self.device)
+            )
+            result["imagined_teleop_reward"] = (
+                detached_reward_sum[teleop_task.bool()].mean() / self.horizon / 0.1
+                if teleop_task.any()
+                else torch.zeros((), device=self.device)
+            )
         if self.mdp.context_layout is not None:
             result["replay_recovery_ratio"] = start["xi"][
                 ..., self.mdp.context_layout.recovery_active
@@ -388,6 +601,7 @@ class SuperMimicAlgorithm:
     def state_dict(self) -> dict:
         return {
             "robot_spec": self.robot_spec.to_dict(),
+            "mixed_tasks": self.mixed_tasks,
             "world_model": self.world_model.state_dict(),
             "policy": self.policy.state_dict(),
             "critic": self.critic.state_dict(),
@@ -402,6 +616,12 @@ class SuperMimicAlgorithm:
         if saved_spec is not None and saved_spec != self.robot_spec.to_dict():
             raise ValueError(
                 f"Checkpoint robot spec {saved_spec} does not match environment {self.robot_spec.to_dict()}."
+            )
+        saved_mixed_tasks = bool(state.get("mixed_tasks", False))
+        if saved_mixed_tasks != self.mixed_tasks:
+            raise ValueError(
+                "Checkpoint task interface does not match the current environment: "
+                f"checkpoint mixed_tasks={saved_mixed_tasks}, current={self.mixed_tasks}."
             )
         self.world_model.load_state_dict(state["world_model"])
         self.policy.load_state_dict(state["policy"])

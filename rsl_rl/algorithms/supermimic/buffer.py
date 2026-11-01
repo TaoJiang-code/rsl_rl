@@ -14,6 +14,7 @@ class ReplayBuffer:
         num_envs: int,
         device: str,
         robot_spec: SuperMimicRobotSpec,
+        mixed_tasks: bool = False,
     ):
         self.time_steps = time_steps
         self.num_envs = num_envs
@@ -29,6 +30,14 @@ class ReplayBuffer:
             "ep_step": ((), torch.int32),
             "done": ((), torch.bool),
         }
+        if mixed_tasks:
+            fields.update(
+                {
+                    "velocity_command": ((3,), torch.float32),
+                    "velocity_time_left": ((), torch.float32),
+                    "teleop_task": ((), torch.bool),
+                }
+            )
         self.data = {
             name: torch.zeros((time_steps, num_envs) + shape, dtype=dtype, device=device)
             for name, (shape, dtype) in fields.items()
@@ -87,6 +96,9 @@ class ReplayBuffer:
             name: self.data[name][row, env]
             for name in ("s", "a_prev", "xi", "f", "ep_step")
         }
+        for name in ("velocity_command", "velocity_time_left", "teleop_task"):
+            if name in self.data:
+                start[name] = self.data[name][row, env]
         history = {
             name: self.data[name][history_rows, history_envs] for name in ("s", "a_prev", "xi", "f")
         }

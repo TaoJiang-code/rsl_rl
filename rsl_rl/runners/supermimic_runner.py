@@ -29,6 +29,7 @@ class SuperMimicRunner:
         self.unwrapped = env.unwrapped
         self.cfg = train_cfg
         self.algorithm_cfg = train_cfg["algorithm"]
+        self.mixed_tasks = bool(self.algorithm_cfg.get("mixed_motion_teleop", False))
         self.log_dir = log_dir
         self.device = device
         self.current_learning_iteration = 0
@@ -38,6 +39,49 @@ class SuperMimicRunner:
         os.makedirs(log_dir, exist_ok=True)
 
         self.motion = self.unwrapped.command_manager.get_term("motion")
+        self.velocity_command_name = str(
+            self.algorithm_cfg.get("velocity_command_name", "velocity")
+        )
+        self.teleop_task = None
+        if self.mixed_tasks:
+            if self.unwrapped.cfg.motion_env_fraction is None:
+                raise ValueError(
+                    "Mixed SuperMimic algorithm requires env_cfg.motion_env_fraction."
+                )
+            motion_fraction = float(self.unwrapped.cfg.motion_env_fraction)
+            if not 0.0 < motion_fraction < 1.0:
+                raise ValueError("Mixed SuperMimic requires motion_env_fraction in (0, 1).")
+            motion_task = self.unwrapped.supermimic_motion_task_mask
+            if motion_task is None:
+                raise RuntimeError("Environment did not create the mixed-task mask.")
+            expected_count = int(env.num_envs * motion_fraction)
+            if expected_count <= 0 or expected_count >= env.num_envs:
+                raise ValueError(
+                    "Mixed SuperMimic training requires at least one environment per task; "
+                    f"got num_envs={env.num_envs}, motion_fraction={motion_fraction}."
+                )
+            if int(motion_task.sum()) != expected_count:
+                raise ValueError(
+                    "Environment and algorithm disagree on the mixed-task split: "
+                    f"env has {int(motion_task.sum())} motion environments, "
+                    f"algorithm expects {expected_count}."
+                )
+            self.teleop_task = ~motion_task
+            self.velocity_term = self.unwrapped.command_manager.get_term(
+                self.velocity_command_name
+            )
+            velocity_cfg = self.velocity_term.cfg
+            self.algorithm_cfg["velocity_command_ranges"] = (
+                tuple(velocity_cfg.ranges.lin_vel_x),
+                tuple(velocity_cfg.ranges.lin_vel_y),
+                tuple(velocity_cfg.ranges.ang_vel_z),
+            )
+            self.algorithm_cfg["velocity_resampling_time_range"] = tuple(
+                velocity_cfg.resampling_time_range
+            )
+            self.algorithm_cfg["velocity_standing_probability"] = float(
+                velocity_cfg.rel_standing_envs
+            )
         self.action_term = self.unwrapped.action_manager.get_term("joint_pos")
         initial_context = self.unwrapped.refresh_supermimic_context()
         context_layout = self.unwrapped.supermimic_context_layout
@@ -76,7 +120,64 @@ class SuperMimicRunner:
         termination_penalty_cfg = getattr(
             self.unwrapped.cfg.rewards, "termination_penalty", None
         )
+
+        def reward_term(*names):
+            for name in names:
+                term = getattr(self.unwrapped.cfg.rewards, name, None)
+                if term is not None:
+                    return term
+            return None
+
+        body_position_cfg = reward_term("motion_body_position", "body_position")
+        body_orientation_cfg = reward_term("motion_body_orientation", "body_orientation")
+        body_linear_velocity_cfg = reward_term(
+            "motion_body_linear_velocity", "body_linear_velocity"
+        )
+        body_angular_velocity_cfg = reward_term(
+            "motion_body_angular_velocity", "body_angular_velocity"
+        )
+        root_position_cfg = reward_term("motion_root_position", "root_position")
+        root_orientation_cfg = reward_term("motion_root_orientation", "root_orientation")
+        action_smoothness_cfg = reward_term("action_smoothness")
+        joint_limit_cfg = reward_term("joint_limit")
+        teleop_linear_velocity_cfg = reward_term("track_lin_vel_xy")
+        teleop_angular_velocity_cfg = reward_term("track_ang_vel_z")
+        teleop_body_position_cfg = reward_term("upper_body_position")
+        teleop_body_orientation_cfg = reward_term("upper_body_orientation")
+        teleop_root_height_cfg = reward_term("pelvis_height")
+        teleop_body_names = (
+            ()
+            if teleop_body_position_cfg is None
+            else tuple(teleop_body_position_cfg.params["body_names"])
+        )
+        if teleop_body_orientation_cfg is not None and tuple(
+            teleop_body_orientation_cfg.params["body_names"]
+        ) != teleop_body_names:
+            raise ValueError(
+                "Teleop position and orientation rewards must track the same body names."
+            )
+
+        def weight(term, default):
+            return default if term is None else float(term.weight)
+
+        def std(term, default):
+            return default if term is None else float(term.params["std"])
+
         reward_cfg = RewardConfig(
+            body_position_weight=weight(body_position_cfg, 0.0),
+            body_position_std=std(body_position_cfg, 0.3),
+            body_orientation_weight=weight(body_orientation_cfg, 0.0),
+            body_orientation_std=std(body_orientation_cfg, 0.4),
+            body_linear_velocity_weight=weight(body_linear_velocity_cfg, 0.0),
+            body_linear_velocity_std=std(body_linear_velocity_cfg, 1.0),
+            body_angular_velocity_weight=weight(body_angular_velocity_cfg, 0.0),
+            body_angular_velocity_std=std(body_angular_velocity_cfg, 3.14),
+            root_position_weight=weight(root_position_cfg, 0.0),
+            root_position_std=std(root_position_cfg, 0.3),
+            root_orientation_weight=weight(root_orientation_cfg, 0.0),
+            root_orientation_std=std(root_orientation_cfg, 0.4),
+            action_rate_weight=weight(action_smoothness_cfg, 0.0),
+            joint_limit_weight=weight(joint_limit_cfg, 0.0),
             termination_penalty_weight=(
                 0.0
                 if termination_penalty_cfg is None
@@ -89,6 +190,16 @@ class SuperMimicRunner:
                 if end_effector_cfg is None
                 else float(end_effector_cfg.params["threshold"])
             ),
+            teleop_linear_velocity_weight=weight(teleop_linear_velocity_cfg, 0.0),
+            teleop_linear_velocity_std=std(teleop_linear_velocity_cfg, 0.5),
+            teleop_angular_velocity_weight=weight(teleop_angular_velocity_cfg, 0.0),
+            teleop_angular_velocity_std=std(teleop_angular_velocity_cfg, 0.5),
+            teleop_body_position_weight=weight(teleop_body_position_cfg, 0.0),
+            teleop_body_position_std=std(teleop_body_position_cfg, 0.3),
+            teleop_body_orientation_weight=weight(teleop_body_orientation_cfg, 0.0),
+            teleop_body_orientation_std=std(teleop_body_orientation_cfg, 0.4),
+            teleop_root_height_weight=weight(teleop_root_height_cfg, 0.0),
+            teleop_root_height_std=std(teleop_root_height_cfg, 0.3),
         )
         self.mdp = SuperMimicMDP(
             kinematics,
@@ -98,11 +209,13 @@ class SuperMimicRunner:
             self.robot_spec,
             context_layout=self.unwrapped.supermimic_context_layout,
             end_effector_body_names=end_effector_body_names,
+            teleop_body_names=teleop_body_names,
             cfg=reward_cfg,
         )
         self.algorithm_cfg["recovery_window_steps"] = max(
             1, int(round(float(self.motion.cfg.recovery_window_s) / self.unwrapped.step_dt))
         )
+        self.algorithm_cfg["control_dt"] = float(self.unwrapped.step_dt)
         self.algorithm = SuperMimicAlgorithm(self.mdp, env.num_envs, self.algorithm_cfg, device)
         self.observation_history = torch.zeros(
             env.num_envs,
@@ -112,6 +225,12 @@ class SuperMimicRunner:
         )
         print(f"[INFO] SuperMimic robot spec: {self.robot_spec.to_dict()}")
         print(f"[INFO] SuperMimic physics context dimension: {self.robot_spec.context_dim}")
+        if self.mixed_tasks:
+            print(
+                "[INFO] SuperMimic mixed allocation: "
+                f"motion={(~self.teleop_task).sum().item()}, "
+                f"teleop={self.teleop_task.sum().item()}"
+            )
         if actuator_delay_groups:
             print(
                 "[INFO] SuperMimic delayed actuator groups: "
@@ -141,7 +260,25 @@ class SuperMimicRunner:
             repeated = observation[:, None].expand_as(self.observation_history)
             self.observation_history = torch.where(fresh[:, None, None], repeated, shifted)
             goal = self.mdp.goal(frame, int(self.algorithm_cfg["goal_frames"]))
-            action = self.algorithm.policy(self.observation_history, goal)
+            velocity_command = None
+            velocity_time_left = None
+            teleop_goal = None
+            if self.mixed_tasks:
+                velocity_command = self.unwrapped.command_manager.get_command(
+                    self.velocity_command_name
+                ).clone()
+                velocity_time_left = self.velocity_term.time_left.clone()
+                teleop_goal = self.mdp.teleop_goal(
+                    frame, int(self.algorithm_cfg["goal_frames"]), velocity_command
+                )
+                action = self.algorithm.policy.forward_mixed(
+                    self.observation_history,
+                    goal,
+                    teleop_goal,
+                    self.teleop_task,
+                )
+            else:
+                action = self.algorithm.policy(self.observation_history, goal)
             action = torch.clamp(
                 action + float(self.algorithm_cfg["action_noise"]) * torch.randn_like(action),
                 -float(self.cfg["clip_actions"]),
@@ -167,10 +304,27 @@ class SuperMimicRunner:
                 "ep_step": episode_step.to(torch.int32),
                 "done": terminated | time_outs,
             }
+            if self.mixed_tasks:
+                transition["velocity_command"] = velocity_command
+                transition["velocity_time_left"] = velocity_time_left
+                transition["teleop_task"] = self.teleop_task
             self.algorithm.replay.add(transition)
-            self.algorithm.update_normalizers(transition, observation, goal)
+            self.algorithm.update_normalizers(
+                transition,
+                observation,
+                goal,
+                teleop_goal=teleop_goal,
+                teleop_task=self.teleop_task,
+            )
             self.sim_steps += self.env.num_envs
             statistics["sim_reward"].append(float(reward.mean() / 0.1))
+            if self.mixed_tasks:
+                statistics["sim_motion_reward"].append(
+                    float(reward[~self.teleop_task].mean() / 0.1)
+                )
+                statistics["sim_teleop_reward"].append(
+                    float(reward[self.teleop_task].mean() / 0.1)
+                )
             statistics["recovery_ratio"].append(
                 0.0
                 if layout is None
@@ -207,7 +361,9 @@ class SuperMimicRunner:
         columns = [
             "iteration", "wall_h", "sim_steps", "world_model_loss", "world_model_error_8",
             "policy_loss", "critic_loss", "imagined_reward", "policy_gradient_norm",
-            "imagined_survival", "sim_reward", "episode_length", "normalized_return",
+            "imagined_survival", "imagined_motion_reward", "imagined_teleop_reward",
+            "sim_reward", "sim_motion_reward", "sim_teleop_reward",
+            "episode_length", "normalized_return",
             "real_recovery_ratio", "replay_recovery_ratio", "imagined_recovery_ratio",
             "valid_imagined_start_ratio", "recovery_assist_anneal", "termination_fraction",
             "soft_termination_height", "soft_termination_tilt", "soft_termination_end_effector",
@@ -232,6 +388,8 @@ class SuperMimicRunner:
             "imagined_reward": self._mean(aggregate["imagined_reward"]),
             "policy_gradient_norm": self._mean(aggregate["policy_gradient_norm"]),
             "imagined_survival": self._mean(aggregate["imagined_survival"]),
+            "imagined_motion_reward": self._mean(aggregate["imagined_motion_reward"]),
+            "imagined_teleop_reward": self._mean(aggregate["imagined_teleop_reward"]),
             "real_recovery_ratio": self._mean(stats["recovery_ratio"]),
             "replay_recovery_ratio": self._mean(aggregate["replay_recovery_ratio"]),
             "imagined_recovery_ratio": self._mean(aggregate["imagined_recovery_ratio"]),
@@ -246,6 +404,8 @@ class SuperMimicRunner:
             "sampling_top1_probability": self._mean(stats["sampling_top1_probability"]),
             "sampling_active_failure_bins": self._mean(stats["sampling_active_failure_bins"]),
             "sim_reward": self._mean(stats["sim_reward"]),
+            "sim_motion_reward": self._mean(stats["sim_motion_reward"]),
+            "sim_teleop_reward": self._mean(stats["sim_teleop_reward"]),
             "episode_length": self._mean(stats["episode_length"]),
             "normalized_return": self._mean(stats["normalized_return"]),
             "termination_fraction": termination_fraction,
@@ -274,7 +434,8 @@ class SuperMimicRunner:
         self.algorithm.critic.train()
         warmup_steps = max(int(self.algorithm_cfg["warmup_steps"]), self.algorithm.world_model_window)
         stats = {name: [] for name in (
-            "sim_reward", "episode_length", "normalized_return", "termination_count", "done_count",
+            "sim_reward", "sim_motion_reward", "sim_teleop_reward",
+            "episode_length", "normalized_return", "termination_count", "done_count",
             "recovery_ratio", "sampling_entropy", "sampling_top1_probability",
             "sampling_active_failure_bins",
         )}
@@ -284,7 +445,8 @@ class SuperMimicRunner:
 
         aggregate = {name: [] for name in (
             "world_model_loss", "world_model_error_8", "policy_loss", "critic_loss",
-            "imagined_reward", "policy_gradient_norm", "imagined_survival",
+            "imagined_reward", "imagined_motion_reward", "imagined_teleop_reward",
+            "policy_gradient_norm", "imagined_survival",
             "replay_recovery_ratio", "imagined_recovery_ratio", "valid_imagined_start_ratio",
             "soft_termination_height", "soft_termination_tilt",
             "soft_termination_end_effector",

@@ -154,24 +154,65 @@ class Policy(nn.Module):
         action_dim: int,
         history_length: int = 10,
         latent_dim: int = 32,
+        teleop_goal_dim: int | None = None,
     ):
         super().__init__()
         self.obs_dim = obs_dim
         self.goal_dim = goal_dim
         self.action_dim = action_dim
         self.history_length = history_length
+        self.teleop_goal_dim = teleop_goal_dim
         self.encoder = mlp(goal_dim, [2048, 1024, 512, 256], latent_dim)
+        self.teleop_encoder = (
+            None
+            if teleop_goal_dim is None
+            else mlp(teleop_goal_dim, [2048, 1024, 512, 256], latent_dim)
+        )
         self.decoder = mlp(latent_dim + obs_dim * history_length, [2048, 1024, 512, 256], action_dim)
         with torch.no_grad():
             self.decoder[-1].weight.mul_(0.01)
             self.decoder[-1].bias.zero_()
         self.obs_norm = RunningNorm(obs_dim)
         self.goal_norm = RunningNorm(goal_dim)
+        self.teleop_goal_norm = (
+            None if teleop_goal_dim is None else RunningNorm(teleop_goal_dim)
+        )
+
+    def _decode(self, observation_history: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+        observation = self.obs_norm(observation_history).flatten(-2)
+        return run_mlp(self.decoder, torch.cat((latent, observation), -1))
 
     def forward(self, observation_history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
         latent = torch.tanh(run_mlp(self.encoder, self.goal_norm(goal)))
-        observation = self.obs_norm(observation_history).flatten(-2)
-        return run_mlp(self.decoder, torch.cat((latent, observation), -1))
+        return self._decode(observation_history, latent)
+
+    def forward_teleop(
+        self,
+        observation_history: torch.Tensor,
+        teleop_goal: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.teleop_encoder is None or self.teleop_goal_norm is None:
+            raise RuntimeError("This SuperMimic policy has no teleop encoder.")
+        latent = torch.tanh(
+            run_mlp(self.teleop_encoder, self.teleop_goal_norm(teleop_goal))
+        )
+        return self._decode(observation_history, latent)
+
+    def forward_mixed(
+        self,
+        observation_history: torch.Tensor,
+        motion_goal: torch.Tensor,
+        teleop_goal: torch.Tensor,
+        teleop_task: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.teleop_encoder is None or self.teleop_goal_norm is None:
+            raise RuntimeError("Mixed SuperMimic inference requires the teleop encoder.")
+        motion_latent = torch.tanh(run_mlp(self.encoder, self.goal_norm(motion_goal)))
+        teleop_latent = torch.tanh(
+            run_mlp(self.teleop_encoder, self.teleop_goal_norm(teleop_goal))
+        )
+        latent = torch.where(teleop_task.bool().unsqueeze(-1), teleop_latent, motion_latent)
+        return self._decode(observation_history, latent)
 
 
 class Critic(nn.Module):

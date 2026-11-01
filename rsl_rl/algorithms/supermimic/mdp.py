@@ -63,6 +63,9 @@ class SuperMimicRobotSpec:
     def goal_dim(self, goal_frames: int) -> int:
         return self.goal_step_dim * goal_frames
 
+    def teleop_goal_dim(self, goal_frames: int) -> int:
+        return 3 + 2 * self.num_joints * goal_frames
+
     def to_dict(self) -> dict[str, int | list[str]]:
         value = {
             "num_joints": self.num_joints,
@@ -152,11 +155,17 @@ def normalize_context(context: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class RewardConfig:
+    body_position_weight: float = 1.0
     body_position_std: float = 0.3
+    body_orientation_weight: float = 1.0
     body_orientation_std: float = 0.4
+    body_linear_velocity_weight: float = 1.0
     body_linear_velocity_std: float = 1.0
+    body_angular_velocity_weight: float = 1.0
     body_angular_velocity_std: float = 3.14
+    root_position_weight: float = 0.5
     root_position_std: float = 0.3
+    root_orientation_weight: float = 0.5
     root_orientation_std: float = 0.4
     action_rate_weight: float = -0.1
     joint_limit_weight: float = -2.0
@@ -164,6 +173,16 @@ class RewardConfig:
     termination_height: float = 0.25
     termination_tilt: float = 0.8
     termination_body_height: float = 0.25
+    teleop_linear_velocity_weight: float = 2.0
+    teleop_linear_velocity_std: float = 0.5
+    teleop_angular_velocity_weight: float = 2.0
+    teleop_angular_velocity_std: float = 0.5
+    teleop_body_position_weight: float = 1.0
+    teleop_body_position_std: float = 0.3
+    teleop_body_orientation_weight: float = 1.0
+    teleop_body_orientation_std: float = 0.4
+    teleop_root_height_weight: float = 0.5
+    teleop_root_height_std: float = 0.3
 
 
 class SuperMimicMDP:
@@ -176,6 +195,7 @@ class SuperMimicMDP:
         robot_spec: SuperMimicRobotSpec,
         context_layout=None,
         end_effector_body_names: tuple[str, ...] = (),
+        teleop_body_names: tuple[str, ...] = (),
         cfg=RewardConfig(),
     ):
         self.kinematics = kinematics
@@ -193,6 +213,10 @@ class SuperMimicMDP:
         self.end_effector_body_ids = tuple(
             tracked_body_names.index(name) for name in end_effector_body_names
         )
+        missing_teleop = set(teleop_body_names).difference(tracked_body_names)
+        if missing_teleop:
+            raise ValueError(f"SuperMimic teleop bodies are not tracked: {sorted(missing_teleop)}.")
+        self.teleop_body_ids = tuple(tracked_body_names.index(name) for name in teleop_body_names)
         device = default_joint_position.device
         self.obs_noise = torch.cat(
             (
@@ -207,6 +231,22 @@ class SuperMimicMDP:
 
     def goal(self, frame: torch.Tensor, count: int) -> torch.Tensor:
         return self.motion.goal(frame, count)
+
+    def teleop_goal(
+        self,
+        frame: torch.Tensor,
+        count: int,
+        velocity_command: torch.Tensor,
+    ) -> torch.Tensor:
+        future = self.motion.future_frames(frame, count)
+        joint_reference = torch.cat(
+            (
+                self.motion.gather_command_motion("joint_pos", future),
+                0.1 * self.motion.gather_command_motion("joint_vel", future),
+            ),
+            dim=-1,
+        ).flatten(-2)
+        return torch.cat((velocity_command, joint_reference), dim=-1)
 
     def observation(self, state, previous_action, context, frame) -> torch.Tensor:
         _, rotation, _, w, q, qd = state
@@ -265,12 +305,18 @@ class SuperMimicMDP:
         root_position_error = (reference_p - p).square().sum(-1)
         root_orientation_error = rot_angle_sq(reference_r, rotation)
         tracking = (
-            torch.exp(-body_position_error / cfg.body_position_std**2)
-            + torch.exp(-body_orientation_error / cfg.body_orientation_std**2)
-            + torch.exp(-body_linear_velocity_error / cfg.body_linear_velocity_std**2)
-            + torch.exp(-body_angular_velocity_error / cfg.body_angular_velocity_std**2)
-            + 0.5 * torch.exp(-root_position_error / cfg.root_position_std**2)
-            + 0.5 * torch.exp(-root_orientation_error / cfg.root_orientation_std**2)
+            cfg.body_position_weight
+            * torch.exp(-body_position_error / cfg.body_position_std**2)
+            + cfg.body_orientation_weight
+            * torch.exp(-body_orientation_error / cfg.body_orientation_std**2)
+            + cfg.body_linear_velocity_weight
+            * torch.exp(-body_linear_velocity_error / cfg.body_linear_velocity_std**2)
+            + cfg.body_angular_velocity_weight
+            * torch.exp(-body_angular_velocity_error / cfg.body_angular_velocity_std**2)
+            + cfg.root_position_weight
+            * torch.exp(-root_position_error / cfg.root_position_std**2)
+            + cfg.root_orientation_weight
+            * torch.exp(-root_orientation_error / cfg.root_orientation_std**2)
         )
         action_rate = (action - previous_action).square().sum(-1)
         joint_limit = (torch.relu(q - self.soft_upper) + torch.relu(self.soft_lower - q)).sum(-1)
@@ -294,6 +340,85 @@ class SuperMimicMDP:
                 "termination_penalty": termination_penalty,
             }
         return reward
+
+    def teleop_reward(
+        self,
+        state,
+        frame,
+        velocity_command,
+        action,
+        previous_action,
+        termination: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        cfg = self.cfg
+        p, rotation, v, w, q, qd = state
+        body_p, body_r, _, _ = self.kinematics.forward(p, rotation, v, w, q, qd)
+        reference_p = self.motion.body_pos_w[frame, 0]
+        reference_r = quat_to_mat(self.motion.body_quat_w[frame, 0])
+        yaw_delta = yaw_mat(rotation @ reference_r.transpose(-1, -2))
+        anchor = torch.cat((p[..., :2], reference_p[..., 2:3]), -1)
+        reference_body_p = anchor.unsqueeze(-2) + (
+            yaw_delta.unsqueeze(-3)
+            @ (self.motion.body_pos_w[frame] - reference_p.unsqueeze(-2)).unsqueeze(-1)
+        ).squeeze(-1)
+        reference_body_r = yaw_delta.unsqueeze(-3) @ quat_to_mat(self.motion.body_quat_w[frame])
+
+        if not self.teleop_body_ids:
+            raise RuntimeError("Teleop reward requires at least one tracked upper-body link.")
+        ids = self.teleop_body_ids
+        body_position_error = (
+            reference_body_p[..., ids, :] - body_p[..., ids, :]
+        ).square().sum(-1).mean(-1)
+        body_orientation_error = rot_angle_sq(
+            reference_body_r[..., ids, :, :], body_r[..., ids, :, :]
+        ).mean(-1)
+        heading_t = yaw_mat(rotation).transpose(-1, -2)
+        local_velocity = (heading_t @ v.unsqueeze(-1)).squeeze(-1)
+        linear_velocity_error = (velocity_command[..., :2] - local_velocity[..., :2]).square().sum(-1)
+        angular_velocity_error = (velocity_command[..., 2] - w[..., 2]).square()
+        root_height_error = (reference_p[..., 2] - p[..., 2]).square()
+        action_rate = (action - previous_action).square().sum(-1)
+        joint_limit = (torch.relu(q - self.soft_upper) + torch.relu(self.soft_lower - q)).sum(-1)
+        termination_penalty = torch.zeros_like(action_rate) if termination is None else termination
+        reward = (
+            cfg.teleop_linear_velocity_weight
+            * torch.exp(-linear_velocity_error / cfg.teleop_linear_velocity_std**2)
+            + cfg.teleop_angular_velocity_weight
+            * torch.exp(-angular_velocity_error / cfg.teleop_angular_velocity_std**2)
+            + cfg.teleop_body_position_weight
+            * torch.exp(-body_position_error / cfg.teleop_body_position_std**2)
+            + cfg.teleop_body_orientation_weight
+            * torch.exp(-body_orientation_error / cfg.teleop_body_orientation_std**2)
+            + cfg.teleop_root_height_weight
+            * torch.exp(-root_height_error / cfg.teleop_root_height_std**2)
+            + cfg.action_rate_weight * action_rate
+            + cfg.joint_limit_weight * joint_limit
+            + cfg.termination_penalty_weight * termination_penalty
+        ) * CONTROL_DT
+        return reward
+
+    def mixed_reward(
+        self,
+        state,
+        frame,
+        velocity_command,
+        teleop_task,
+        action,
+        previous_action,
+        termination: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        motion_reward = self.reward(
+            state, frame, action, previous_action, termination=termination
+        )
+        teleop_reward = self.teleop_reward(
+            state,
+            frame,
+            velocity_command,
+            action,
+            previous_action,
+            termination=termination,
+        )
+        return torch.where(teleop_task.bool(), teleop_reward, motion_reward)
 
     def advance_context(
         self,

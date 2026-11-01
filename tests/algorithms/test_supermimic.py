@@ -13,7 +13,7 @@ from rsl_rl.algorithms.supermimic.mdp import (
     flatten_state,
     unflatten_state,
 )
-from rsl_rl.algorithms.supermimic.networks import WorldModel
+from rsl_rl.algorithms.supermimic.networks import Policy, WorldModel
 from rsl_rl.algorithms.supermimic.rotations import so3_exp, so3_log
 
 
@@ -98,6 +98,7 @@ def test_q1_robot_spec_dimensions():
     assert spec.state_increment_dim == 56
     assert spec.critic_extra_dim == 93
     assert spec.goal_dim(10) == 590
+    assert spec.teleop_goal_dim(10) == 443
     state = (
         torch.randn(4, 3),
         torch.eye(3).expand(4, -1, -1),
@@ -109,6 +110,52 @@ def test_q1_robot_spec_dimensions():
     rebuilt = unflatten_state(flatten_state(state))
     for actual, expected in zip(rebuilt, state):
         torch.testing.assert_close(actual, expected)
+
+
+def test_mixed_policy_and_replay_dimensions():
+    assert G1_ROBOT_SPEC.goal_dim(10) == 730
+    assert G1_ROBOT_SPEC.teleop_goal_dim(10) == 583
+    policy = Policy(
+        G1_ROBOT_SPEC.observation_dim,
+        G1_ROBOT_SPEC.goal_dim(10),
+        G1_ROBOT_SPEC.num_joints,
+        history_length=10,
+        teleop_goal_dim=G1_ROBOT_SPEC.teleop_goal_dim(10),
+    )
+    batch = 4
+    history = torch.randn(batch, 10, G1_ROBOT_SPEC.observation_dim)
+    motion_goal = torch.randn(batch, G1_ROBOT_SPEC.goal_dim(10))
+    teleop_goal = torch.randn(batch, G1_ROBOT_SPEC.teleop_goal_dim(10))
+    teleop_task = torch.tensor([False, False, True, True])
+    action = policy.forward_mixed(history, motion_goal, teleop_goal, teleop_task)
+    assert action.shape == (batch, G1_ROBOT_SPEC.num_joints)
+
+    replay = ReplayBuffer(
+        time_steps=2,
+        num_envs=batch,
+        device="cpu",
+        robot_spec=G1_ROBOT_SPEC,
+        mixed_tasks=True,
+    )
+    transition = {
+        "s": torch.zeros(batch, G1_ROBOT_SPEC.state_dim),
+        "s1": torch.zeros(batch, G1_ROBOT_SPEC.state_dim),
+        "a": torch.zeros(batch, G1_ROBOT_SPEC.num_joints),
+        "a_prev": torch.zeros(batch, G1_ROBOT_SPEC.num_joints),
+        "xi": torch.zeros(batch, G1_ROBOT_SPEC.context_dim),
+        "r": torch.zeros(batch),
+        "f": torch.zeros(batch, dtype=torch.long),
+        "ep_step": torch.zeros(batch, dtype=torch.int32),
+        "done": torch.zeros(batch, dtype=torch.bool),
+        "velocity_command": torch.randn(batch, 3),
+        "velocity_time_left": torch.linspace(3.0, 6.0, batch),
+        "teleop_task": teleop_task,
+    }
+    replay.add(transition)
+    start, _ = replay.sample_starts(8, history_length=10)
+    assert start["velocity_command"].shape == (8, 3)
+    assert start["velocity_time_left"].shape == (8,)
+    assert start["teleop_task"].dtype == torch.bool
 
 
 def test_full_physics_context_spec_and_recovery_expiry():
