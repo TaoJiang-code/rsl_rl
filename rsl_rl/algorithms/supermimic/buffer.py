@@ -36,6 +36,8 @@ class ReplayBuffer:
                     "velocity_command": ((3,), torch.float32),
                     "velocity_time_left": ((), torch.float32),
                     "teleop_task": ((), torch.bool),
+                    "reference_yaw_rotation": ((3, 3), torch.float32),
+                    "reference_translation": ((3,), torch.float32),
                 }
             )
         self.data = {
@@ -104,11 +106,21 @@ class ReplayBuffer:
             name: self.data[name][row, env]
             for name in ("s", "a_prev", "xi", "f", "ep_step")
         }
-        for name in ("velocity_command", "velocity_time_left", "teleop_task"):
+        for name in (
+            "velocity_command",
+            "velocity_time_left",
+            "teleop_task",
+            "reference_yaw_rotation",
+            "reference_translation",
+        ):
             if name in self.data:
                 start[name] = self.data[name][row, env]
+        history_names = ["s", "a_prev", "xi", "f"]
+        for name in ("reference_yaw_rotation", "reference_translation"):
+            if name in self.data:
+                history_names.append(name)
         history = {
-            name: self.data[name][history_rows, history_envs] for name in ("s", "a_prev", "xi", "f")
+            name: self.data[name][history_rows, history_envs] for name in history_names
         }
         return start, history
 

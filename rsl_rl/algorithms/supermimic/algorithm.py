@@ -341,6 +341,8 @@ class SuperMimicAlgorithm:
         velocity_command,
         velocity_time_left,
         teleop_task,
+        reference_yaw_rotation,
+        reference_translation,
         previous_action,
     ):
         action = self.policy.forward_mixed(
@@ -348,18 +350,36 @@ class SuperMimicAlgorithm:
         )
         next_state = self.world_model.step(state, action, normalized_context, previous_action)
         next_frame = frame + 1
-        observation = self.mdp.add_noise(
-            self.mdp.observation(next_state, action, context, next_frame)
-        )
-        next_history = torch.cat((observation_history[:, 1:], observation[:, None]), 1)
         next_velocity_command, next_velocity_time_left = self._advance_velocity_command(
             velocity_command, velocity_time_left
         )
+        next_teleop_task = self._advance_task_mode(teleop_task)
+        next_reference_yaw = reference_yaw_rotation
+        next_reference_translation = reference_translation
+        teleop_to_motion = teleop_task.bool() & ~next_teleop_task
+        switched_yaw, switched_translation = self.mdp.reanchor_reference(
+            next_state, next_frame
+        )
+        next_reference_yaw = torch.where(
+            teleop_to_motion[:, None, None], switched_yaw, reference_yaw_rotation
+        )
+        next_reference_translation = torch.where(
+            teleop_to_motion[:, None], switched_translation, reference_translation
+        )
+        observation = self.mdp.add_noise(
+            self.mdp.observation(
+                next_state,
+                action,
+                context,
+                next_frame,
+                reference_yaw_rotation=next_reference_yaw,
+            )
+        )
+        next_history = torch.cat((observation_history[:, 1:], observation[:, None]), 1)
         next_motion_goal = self.mdp.goal(next_frame, self.goal_frames)
         next_teleop_goal = self.mdp.teleop_goal(
             next_frame, self.goal_frames, next_velocity_command
         )
-        next_teleop_task = self._advance_task_mode(teleop_task)
         return (
             next_state,
             action,
@@ -370,6 +390,8 @@ class SuperMimicAlgorithm:
             next_velocity_command,
             next_velocity_time_left,
             next_teleop_task,
+            next_reference_yaw,
+            next_reference_translation,
         )
 
     def _advance_task_mode(self, teleop_task):
@@ -418,6 +440,8 @@ class SuperMimicAlgorithm:
         action,
         previous_action,
         context,
+        reference_yaw_rotation,
+        reference_translation,
     ):
         termination, terms = self.mdp.soft_termination(
             state, frame, context, return_terms=True
@@ -430,6 +454,8 @@ class SuperMimicAlgorithm:
                 teleop_task,
                 action,
                 previous_action,
+                reference_yaw_rotation,
+                reference_translation,
                 termination=termination,
             ),
             termination,
@@ -548,10 +574,16 @@ class SuperMimicAlgorithm:
         velocity_command = start.get("velocity_command")
         velocity_time_left = start.get("velocity_time_left")
         teleop_task = start.get("teleop_task")
+        reference_yaw_rotation = start.get("reference_yaw_rotation")
+        reference_translation = start.get("reference_translation")
         initial_teleop_task = teleop_task
         with torch.no_grad():
             observation_history = self.mdp.observation(
-                unflatten_state(history["s"]), history["a_prev"], history["xi"], history["f"]
+                unflatten_state(history["s"]),
+                history["a_prev"],
+                history["xi"],
+                history["f"],
+                reference_yaw_rotation=history.get("reference_yaw_rotation"),
             )
         observation_history = self.mdp.add_noise(observation_history)
 
@@ -564,7 +596,13 @@ class SuperMimicAlgorithm:
         initial_teleop_goal = None
         teleop_goal = None
         if self.mixed_tasks:
-            if velocity_command is None or velocity_time_left is None or teleop_task is None:
+            if (
+                velocity_command is None
+                or velocity_time_left is None
+                or teleop_task is None
+                or reference_yaw_rotation is None
+                or reference_translation is None
+            ):
                 raise RuntimeError("Mixed SuperMimic replay is missing task metadata.")
             initial_teleop_goal = self.mdp.teleop_goal(
                 frame, self.goal_frames, velocity_command
@@ -575,12 +613,16 @@ class SuperMimicAlgorithm:
         velocity_commands = []
         task_modes = []
         next_task_modes = []
+        reference_yaw_rotations = []
+        reference_translations = []
         contexts = [context]
         for _ in range(self.horizon):
             previous_actions.append(previous_action)
             if self.mixed_tasks:
                 velocity_commands.append(velocity_command)
                 task_modes.append(teleop_task)
+                reference_yaw_rotations.append(reference_yaw_rotation)
+                reference_translations.append(reference_translation)
                 (
                     state,
                     previous_action,
@@ -591,6 +633,8 @@ class SuperMimicAlgorithm:
                     velocity_command,
                     velocity_time_left,
                     teleop_task,
+                    reference_yaw_rotation,
+                    reference_translation,
                 ) = self.imagination_step(
                     state,
                     observation_history,
@@ -602,6 +646,8 @@ class SuperMimicAlgorithm:
                     velocity_command,
                     velocity_time_left,
                     teleop_task,
+                    reference_yaw_rotation,
+                    reference_translation,
                     previous_action,
                 )
                 teleop_goals.append(teleop_goal)
@@ -640,6 +686,8 @@ class SuperMimicAlgorithm:
                 flatten(actions),
                 flatten(previous_actions),
                 flatten(contexts[1:]),
+                flatten(reference_yaw_rotations),
+                flatten(reference_translations),
             )
         else:
             rewards, terminations, termination_terms = self.reward_termination(

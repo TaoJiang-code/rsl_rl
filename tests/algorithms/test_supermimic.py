@@ -15,7 +15,7 @@ from rsl_rl.algorithms.supermimic.mdp import (
     unflatten_state,
 )
 from rsl_rl.algorithms.supermimic.networks import Policy, WorldModel
-from rsl_rl.algorithms.supermimic.rotations import so3_exp, so3_log
+from rsl_rl.algorithms.supermimic.rotations import quat_to_mat, so3_exp, so3_log
 
 
 JOINT_NAMES = [
@@ -151,12 +151,66 @@ def test_mixed_policy_and_replay_dimensions():
         "velocity_command": torch.randn(batch, 3),
         "velocity_time_left": torch.linspace(3.0, 6.0, batch),
         "teleop_task": teleop_task,
+        "reference_yaw_rotation": torch.eye(3).expand(batch, -1, -1).clone(),
+        "reference_translation": torch.zeros(batch, 3),
     }
     replay.add(transition)
     start, _ = replay.sample_starts(8, history_length=10)
     assert start["velocity_command"].shape == (8, 3)
     assert start["velocity_time_left"].shape == (8,)
     assert start["teleop_task"].dtype == torch.bool
+    assert start["reference_yaw_rotation"].shape == (8, 3, 3)
+    assert start["reference_translation"].shape == (8, 3)
+
+
+def test_teleop_to_motion_reanchor_is_frozen_and_preserves_reference_delta():
+    def yaw_quat(degrees: float) -> torch.Tensor:
+        angle = torch.deg2rad(torch.tensor(degrees)) / 2.0
+        return torch.stack(
+            (torch.cos(angle), torch.tensor(0.0), torch.tensor(0.0), torch.sin(angle))
+        )
+
+    mdp = SuperMimicMDP.__new__(SuperMimicMDP)
+    mdp.motion = SimpleNamespace(
+        body_pos_w=torch.tensor(
+            [
+                [[1.0, 2.0, 0.8]],
+                [[2.0, 2.0, 0.8]],
+            ]
+        ),
+        body_quat_w=torch.stack(
+            (
+                yaw_quat(30.0).view(1, 4),
+                yaw_quat(45.0).view(1, 4),
+            )
+        ),
+    )
+    robot_rotation = quat_to_mat(yaw_quat(120.0).view(1, 4))
+    state = (
+        torch.tensor([[7.0, -3.0, 0.8]]),
+        robot_rotation,
+        torch.zeros(1, 3),
+        torch.zeros(1, 3),
+        torch.zeros(1, 1),
+        torch.zeros(1, 1),
+    )
+
+    yaw_rotation, translation = mdp.reanchor_reference(state, torch.tensor([0]))
+    aligned_position_0 = (
+        yaw_rotation @ mdp.motion.body_pos_w[0, 0].view(1, 3, 1)
+    ).squeeze(-1) + translation
+    aligned_rotation_0 = yaw_rotation @ quat_to_mat(mdp.motion.body_quat_w[0, 0].view(1, 4))
+    torch.testing.assert_close(aligned_position_0[:, :2], state[0][:, :2])
+    torch.testing.assert_close(aligned_rotation_0, robot_rotation, atol=1e-5, rtol=1e-5)
+
+    aligned_position_1 = (
+        yaw_rotation @ mdp.motion.body_pos_w[1, 0].view(1, 3, 1)
+    ).squeeze(-1) + translation
+    aligned_rotation_1 = yaw_rotation @ quat_to_mat(mdp.motion.body_quat_w[1, 0].view(1, 4))
+    expected_position_1 = torch.tensor([[7.0, -2.0]])
+    expected_rotation_1 = quat_to_mat(yaw_quat(135.0).view(1, 4))
+    torch.testing.assert_close(aligned_position_1[:, :2], expected_position_1, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(aligned_rotation_1, expected_rotation_1, atol=1e-5, rtol=1e-5)
 
 
 def test_imagined_task_mode_switch_boundaries():

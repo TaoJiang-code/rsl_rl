@@ -249,8 +249,19 @@ class SuperMimicRunner:
             frame = self.motion.time_steps.clone()
             previous_action = self.action_term.raw_actions.clone()
             episode_step = self.unwrapped.episode_length_buf.clone()
+            reference_yaw_rotation = None
+            reference_translation = None
+            if self.mixed_tasks:
+                reference_yaw_rotation = self.motion.reference_yaw_rotation.clone()
+                reference_translation = self.motion.reference_translation.clone()
             observation = self.mdp.add_noise(
-                self.mdp.observation(state, previous_action, context, frame)
+                self.mdp.observation(
+                    state,
+                    previous_action,
+                    context,
+                    frame,
+                    reference_yaw_rotation=reference_yaw_rotation,
+                )
             )
             fresh = episode_step == 0
             shifted = torch.cat((self.observation_history[:, 1:], observation[:, None]), 1)
@@ -307,6 +318,8 @@ class SuperMimicRunner:
                 transition["velocity_command"] = velocity_command
                 transition["velocity_time_left"] = velocity_time_left
                 transition["teleop_task"] = teleop_task
+                transition["reference_yaw_rotation"] = reference_yaw_rotation
+                transition["reference_translation"] = reference_translation
             self.algorithm.replay.add(transition)
             self.algorithm.update_normalizers(
                 transition,

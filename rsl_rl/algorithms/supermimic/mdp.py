@@ -257,7 +257,14 @@ class SuperMimicMDP:
         yaw_rate = self.motion.body_ang_vel_w[frame, 0, 2:3]
         return torch.cat((local_velocity[..., :2], yaw_rate), dim=-1)
 
-    def observation(self, state, previous_action, context, frame) -> torch.Tensor:
+    def observation(
+        self,
+        state,
+        previous_action,
+        context,
+        frame,
+        reference_yaw_rotation: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         _, rotation, _, w, q, qd = state
         rotation_t = rotation.transpose(-1, -2)
         calibration_slice = (
@@ -267,10 +274,12 @@ class SuperMimicMDP:
         )
         calibration = context[..., calibration_slice]
         projected_gravity = -rotation[..., 2, :]
-        relative_reference = mat_to_6d(
-            rotation_t
-            @ quat_to_mat(self.motion.gather_command_motion("body_quat_w", frame)[..., 0, :])
+        reference_rotation = quat_to_mat(
+            self.motion.gather_command_motion("body_quat_w", frame)[..., 0, :]
         )
+        if reference_yaw_rotation is not None:
+            reference_rotation = reference_yaw_rotation @ reference_rotation
+        relative_reference = mat_to_6d(rotation_t @ reference_rotation)
         return torch.cat(
             (
                 q - self.default_joint_position - calibration,
@@ -286,6 +295,22 @@ class SuperMimicMDP:
     def add_noise(self, observation: torch.Tensor) -> torch.Tensor:
         return observation + (2 * torch.rand_like(observation) - 1) * self.obs_noise
 
+    def reanchor_reference(self, state, frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the frozen SE(2) transform that aligns this reference frame to state."""
+        p, rotation, _, _, _, _ = state
+        reference_p = self.motion.body_pos_w[frame, 0]
+        reference_r = quat_to_mat(self.motion.body_quat_w[frame, 0])
+        yaw_rotation = yaw_mat(rotation @ reference_r.transpose(-1, -2))
+        rotated_reference_p = (yaw_rotation @ reference_p.unsqueeze(-1)).squeeze(-1)
+        translation = torch.cat(
+            (
+                p[..., :2] - rotated_reference_p[..., :2],
+                torch.zeros_like(p[..., 2:3]),
+            ),
+            dim=-1,
+        )
+        return yaw_rotation, translation
+
     def reward(
         self,
         state,
@@ -294,23 +319,50 @@ class SuperMimicMDP:
         previous_action,
         return_terms: bool = False,
         termination: torch.Tensor | None = None,
+        reference_yaw_rotation: torch.Tensor | None = None,
+        reference_translation: torch.Tensor | None = None,
     ):
         cfg = self.cfg
         p, rotation, v, w, q, qd = state
         body_p, body_r, body_v, body_w = self.kinematics.forward(p, rotation, v, w, q, qd)
         reference_p = self.motion.body_pos_w[frame, 0]
         reference_r = quat_to_mat(self.motion.body_quat_w[frame, 0])
+        reference_body_p_raw = self.motion.body_pos_w[frame]
+        reference_body_r_raw = quat_to_mat(self.motion.body_quat_w[frame])
+        reference_body_v = self.motion.body_lin_vel_w[frame]
+        reference_body_w = self.motion.body_ang_vel_w[frame]
+        if reference_yaw_rotation is not None:
+            reference_p = (
+                reference_yaw_rotation @ reference_p.unsqueeze(-1)
+            ).squeeze(-1)
+            reference_r = reference_yaw_rotation @ reference_r
+            reference_body_p_raw = (
+                reference_yaw_rotation.unsqueeze(-3)
+                @ reference_body_p_raw.unsqueeze(-1)
+            ).squeeze(-1)
+            reference_body_r_raw = reference_yaw_rotation.unsqueeze(-3) @ reference_body_r_raw
+            reference_body_v = (
+                reference_yaw_rotation.unsqueeze(-3)
+                @ reference_body_v.unsqueeze(-1)
+            ).squeeze(-1)
+            reference_body_w = (
+                reference_yaw_rotation.unsqueeze(-3)
+                @ reference_body_w.unsqueeze(-1)
+            ).squeeze(-1)
+        if reference_translation is not None:
+            reference_p = reference_p + reference_translation
+            reference_body_p_raw = reference_body_p_raw + reference_translation.unsqueeze(-2)
         yaw_delta = yaw_mat(rotation @ reference_r.transpose(-1, -2))
         anchor = torch.cat((p[..., :2], reference_p[..., 2:3]), -1)
         reference_body_p = anchor.unsqueeze(-2) + (
             yaw_delta.unsqueeze(-3)
-            @ (self.motion.body_pos_w[frame] - reference_p.unsqueeze(-2)).unsqueeze(-1)
+            @ (reference_body_p_raw - reference_p.unsqueeze(-2)).unsqueeze(-1)
         ).squeeze(-1)
-        reference_body_r = yaw_delta.unsqueeze(-3) @ quat_to_mat(self.motion.body_quat_w[frame])
+        reference_body_r = yaw_delta.unsqueeze(-3) @ reference_body_r_raw
         body_position_error = (reference_body_p - body_p).square().sum(-1).mean(-1)
         body_orientation_error = rot_angle_sq(reference_body_r, body_r).mean(-1)
-        body_linear_velocity_error = (self.motion.body_lin_vel_w[frame] - body_v).square().sum(-1).mean(-1)
-        body_angular_velocity_error = (self.motion.body_ang_vel_w[frame] - body_w).square().sum(-1).mean(-1)
+        body_linear_velocity_error = (reference_body_v - body_v).square().sum(-1).mean(-1)
+        body_angular_velocity_error = (reference_body_w - body_w).square().sum(-1).mean(-1)
         root_position_error = (reference_p - p).square().sum(-1)
         root_orientation_error = rot_angle_sq(reference_r, rotation)
         tracking = (
@@ -414,10 +466,18 @@ class SuperMimicMDP:
         teleop_task,
         action,
         previous_action,
+        reference_yaw_rotation,
+        reference_translation,
         termination: torch.Tensor | None = None,
     ) -> torch.Tensor:
         motion_reward = self.reward(
-            state, frame, action, previous_action, termination=termination
+            state,
+            frame,
+            action,
+            previous_action,
+            termination=termination,
+            reference_yaw_rotation=reference_yaw_rotation,
+            reference_translation=reference_translation,
         )
         teleop_reward = self.teleop_reward(
             state,
