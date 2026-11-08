@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from rsl_rl.algorithms.supermimic.algorithm import SuperMimicAlgorithm
 from rsl_rl.algorithms.supermimic.buffer import ReplayBuffer
 from rsl_rl.algorithms.supermimic.kinematics import UrdfKinematics
 from rsl_rl.algorithms.supermimic.mdp import (
@@ -156,6 +157,17 @@ def test_mixed_policy_and_replay_dimensions():
     assert start["velocity_command"].shape == (8, 3)
     assert start["velocity_time_left"].shape == (8,)
     assert start["teleop_task"].dtype == torch.bool
+
+
+def test_imagined_task_mode_switch_boundaries():
+    algorithm = SuperMimicAlgorithm.__new__(SuperMimicAlgorithm)
+    task = torch.tensor([False, True, False, True])
+
+    algorithm.cfg = {"task_switch_probability": 0.0}
+    torch.testing.assert_close(algorithm._advance_task_mode(task), task)
+
+    algorithm.cfg = {"task_switch_probability": 1.0}
+    torch.testing.assert_close(algorithm._advance_task_mode(task), ~task)
 
 
 def test_full_physics_context_spec_and_recovery_expiry():

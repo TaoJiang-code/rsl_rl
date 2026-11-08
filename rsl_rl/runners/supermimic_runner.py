@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import time
 from pathlib import Path
@@ -42,7 +43,7 @@ class SuperMimicRunner:
         self.velocity_command_name = str(
             self.algorithm_cfg.get("velocity_command_name", "velocity")
         )
-        self.teleop_task = None
+        self.initial_teleop_task = None
         if self.mixed_tasks:
             if self.unwrapped.cfg.motion_env_fraction is None:
                 raise ValueError(
@@ -54,20 +55,7 @@ class SuperMimicRunner:
             motion_task = self.unwrapped.supermimic_motion_task_mask
             if motion_task is None:
                 raise RuntimeError("Environment did not create the mixed-task mask.")
-            expected_count = int(env.num_envs * motion_fraction)
-            if expected_count <= 0 or expected_count >= env.num_envs:
-                raise ValueError(
-                    "Mixed SuperMimic training requires at least one environment per task; "
-                    f"got num_envs={env.num_envs}, motion_fraction={motion_fraction}."
-                )
-            if int(motion_task.sum()) != expected_count:
-                raise ValueError(
-                    "Environment and algorithm disagree on the mixed-task split: "
-                    f"env has {int(motion_task.sum())} motion environments, "
-                    f"algorithm expects {expected_count}."
-                )
-            self.teleop_task = ~motion_task
-            self.algorithm_cfg["motion_env_count"] = int(motion_task.sum())
+            self.initial_teleop_task = ~motion_task
             self.velocity_term = self.unwrapped.command_manager.get_term(
                 self.velocity_command_name
             )
@@ -217,6 +205,13 @@ class SuperMimicRunner:
             1, int(round(float(self.motion.cfg.recovery_window_s) / self.unwrapped.step_dt))
         )
         self.algorithm_cfg["control_dt"] = float(self.unwrapped.step_dt)
+        task_switch_mean = self.unwrapped.cfg.task_switch_mean_time_s
+        self.algorithm_cfg["task_switch_probability"] = (
+            0.0
+            if task_switch_mean is None
+            else 1.0
+            - math.exp(-float(self.unwrapped.step_dt) / float(task_switch_mean))
+        )
         self.algorithm = SuperMimicAlgorithm(self.mdp, env.num_envs, self.algorithm_cfg, device)
         self.observation_history = torch.zeros(
             env.num_envs,
@@ -228,9 +223,10 @@ class SuperMimicRunner:
         print(f"[INFO] SuperMimic physics context dimension: {self.robot_spec.context_dim}")
         if self.mixed_tasks:
             print(
-                "[INFO] SuperMimic mixed allocation: "
-                f"motion={(~self.teleop_task).sum().item()}, "
-                f"teleop={self.teleop_task.sum().item()}"
+                "[INFO] SuperMimic initial mixed allocation: "
+                f"motion={(~self.initial_teleop_task).sum().item()}, "
+                f"teleop={self.initial_teleop_task.sum().item()}, "
+                f"switch_mean_s={self.unwrapped.cfg.task_switch_mean_time_s}"
             )
         if actuator_delay_groups:
             print(
@@ -264,7 +260,9 @@ class SuperMimicRunner:
             velocity_command = None
             velocity_time_left = None
             teleop_goal = None
+            teleop_task = None
             if self.mixed_tasks:
+                teleop_task = (~self.unwrapped.supermimic_motion_task_mask).clone()
                 velocity_command = self.unwrapped.command_manager.get_command(
                     self.velocity_command_name
                 ).clone()
@@ -276,7 +274,7 @@ class SuperMimicRunner:
                     self.observation_history,
                     goal,
                     teleop_goal,
-                    self.teleop_task,
+                    teleop_task,
                 )
             else:
                 action = self.algorithm.policy(self.observation_history, goal)
@@ -308,24 +306,26 @@ class SuperMimicRunner:
             if self.mixed_tasks:
                 transition["velocity_command"] = velocity_command
                 transition["velocity_time_left"] = velocity_time_left
-                transition["teleop_task"] = self.teleop_task
+                transition["teleop_task"] = teleop_task
             self.algorithm.replay.add(transition)
             self.algorithm.update_normalizers(
                 transition,
                 observation,
                 goal,
                 teleop_goal=teleop_goal,
-                teleop_task=self.teleop_task,
+                teleop_task=teleop_task,
             )
             self.sim_steps += self.env.num_envs
             statistics["sim_reward"].append(float(reward.mean() / 0.1))
             if self.mixed_tasks:
-                statistics["sim_motion_reward"].append(
-                    float(reward[~self.teleop_task].mean() / 0.1)
-                )
-                statistics["sim_teleop_reward"].append(
-                    float(reward[self.teleop_task].mean() / 0.1)
-                )
+                if (~teleop_task).any():
+                    statistics["sim_motion_reward"].append(
+                        float(reward[~teleop_task].mean() / 0.1)
+                    )
+                if teleop_task.any():
+                    statistics["sim_teleop_reward"].append(
+                        float(reward[teleop_task].mean() / 0.1)
+                    )
             statistics["recovery_ratio"].append(
                 0.0
                 if layout is None

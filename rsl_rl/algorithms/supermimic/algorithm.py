@@ -229,23 +229,7 @@ class SuperMimicAlgorithm:
     def world_model_update(self) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = int(self.cfg["world_model_batch_size"])
         window = self.world_model_window
-        if self.mixed_tasks:
-            motion_count = int(self.cfg["motion_env_count"])
-            motion_batch = batch_size // 2
-            motion_sample = self.replay.sample_windows(
-                motion_batch, window, env_range=(0, motion_count)
-            )
-            teleop_sample = self.replay.sample_windows(
-                batch_size - motion_batch,
-                window,
-                env_range=(motion_count, self.replay.num_envs),
-            )
-            sample = {
-                key: torch.cat((motion_sample[key], teleop_sample[key]), dim=0)
-                for key in motion_sample
-            }
-        else:
-            sample = self.replay.sample_windows(batch_size, window)
+        sample = self.replay.sample_windows(batch_size, window)
         predicted = self.world_model_rollout(
             sample["s"], sample["a"], sample["a_prev"], sample["xi"]
         )
@@ -375,6 +359,7 @@ class SuperMimicAlgorithm:
         next_teleop_goal = self.mdp.teleop_goal(
             next_frame, self.goal_frames, next_velocity_command
         )
+        next_teleop_task = self._advance_task_mode(teleop_task)
         return (
             next_state,
             action,
@@ -384,7 +369,13 @@ class SuperMimicAlgorithm:
             next_teleop_goal,
             next_velocity_command,
             next_velocity_time_left,
+            next_teleop_task,
         )
+
+    def _advance_task_mode(self, teleop_task):
+        probability = float(self.cfg.get("task_switch_probability", 0.0))
+        switches = torch.rand(teleop_task.shape, device=teleop_task.device) < probability
+        return teleop_task.bool() ^ switches
 
     def _advance_velocity_command(self, command, time_left):
         next_time = time_left - float(self.cfg.get("control_dt", 0.02))
@@ -557,6 +548,7 @@ class SuperMimicAlgorithm:
         velocity_command = start.get("velocity_command")
         velocity_time_left = start.get("velocity_time_left")
         teleop_task = start.get("teleop_task")
+        initial_teleop_task = teleop_task
         with torch.no_grad():
             observation_history = self.mdp.observation(
                 unflatten_state(history["s"]), history["a_prev"], history["xi"], history["f"]
@@ -581,11 +573,14 @@ class SuperMimicAlgorithm:
         states, actions, previous_actions, frames, goals = [], [], [], [], []
         teleop_goals = []
         velocity_commands = []
+        task_modes = []
+        next_task_modes = []
         contexts = [context]
         for _ in range(self.horizon):
             previous_actions.append(previous_action)
             if self.mixed_tasks:
                 velocity_commands.append(velocity_command)
+                task_modes.append(teleop_task)
                 (
                     state,
                     previous_action,
@@ -595,6 +590,7 @@ class SuperMimicAlgorithm:
                     teleop_goal,
                     velocity_command,
                     velocity_time_left,
+                    teleop_task,
                 ) = self.imagination_step(
                     state,
                     observation_history,
@@ -609,6 +605,7 @@ class SuperMimicAlgorithm:
                     previous_action,
                 )
                 teleop_goals.append(teleop_goal)
+                next_task_modes.append(teleop_task)
             else:
                 state, previous_action, observation_history, frame, goal = self.imagination_step(
                     state,
@@ -639,7 +636,7 @@ class SuperMimicAlgorithm:
                 all_states,
                 flatten(frames),
                 flatten(velocity_commands),
-                teleop_task.repeat(self.horizon),
+                flatten(task_modes),
                 flatten(actions),
                 flatten(previous_actions),
                 flatten(contexts[1:]),
@@ -687,8 +684,8 @@ class SuperMimicAlgorithm:
         motion_policy_loss = torch.zeros((), device=self.device)
         teleop_policy_loss = torch.zeros((), device=self.device)
         if self.mixed_tasks:
-            motion_mask = ~teleop_task.bool()
-            teleop_mask = teleop_task.bool()
+            motion_mask = ~initial_teleop_task.bool()
+            teleop_mask = initial_teleop_task.bool()
             motion_policy_loss = -objective[motion_mask].mean()
 
             alignment_frames = torch.cat((start["f"][None], torch.stack(frames)), 0)
@@ -701,17 +698,22 @@ class SuperMimicAlgorithm:
             alignment_teleop_goals = self.mdp.teleop_goal(
                 alignment_frames.flatten(), self.goal_frames, reference_command.flatten(0, 1)
             ).view(self.horizon + 1, batch_size, -1)
+            alignment_task_modes = torch.cat(
+                (initial_teleop_task[None], torch.stack(next_task_modes)), 0
+            ).bool()
+            alignment_mask = alignment_task_modes.flatten()
             with torch.no_grad():
                 target_latent = self.policy.encode_motion(
-                    alignment_motion_goals[:, teleop_mask].flatten(0, 1)
+                    alignment_motion_goals.flatten(0, 1)[alignment_mask]
                 )
             predicted_latent = self.policy.encode_teleop(
-                alignment_teleop_goals[:, teleop_mask].flatten(0, 1)
+                alignment_teleop_goals.flatten(0, 1)[alignment_mask]
             )
             alignment_loss = (predicted_latent - target_latent).square().mean()
             teleop_policy_loss = -objective[teleop_mask].mean() + float(
                 self.cfg.get("velocity_alignment_weight", 0.1)
             ) * alignment_loss
+            joint_policy_loss = -objective.mean()
 
             motion_parameters = list(
                 chain(self.policy.encoder.parameters(), self.policy.decoder.parameters())
@@ -720,9 +722,13 @@ class SuperMimicAlgorithm:
             self.policy_optimizer.zero_grad(set_to_none=True)
             self.teleop_optimizer.zero_grad(set_to_none=True)
             motion_gradients = torch.autograd.grad(
-                motion_policy_loss, motion_parameters, retain_graph=True
+                joint_policy_loss, motion_parameters, retain_graph=True
             )
-            teleop_gradients = torch.autograd.grad(teleop_policy_loss, teleop_parameters)
+            teleop_gradients = torch.autograd.grad(
+                joint_policy_loss
+                + float(self.cfg.get("velocity_alignment_weight", 0.1)) * alignment_loss,
+                teleop_parameters,
+            )
             for parameter, gradient in zip(motion_parameters, motion_gradients):
                 parameter.grad = gradient
             for parameter, gradient in zip(teleop_parameters, teleop_gradients):
@@ -736,7 +742,9 @@ class SuperMimicAlgorithm:
                 self.policy_optimizer.step()
             if torch.isfinite(teleop_gradient_norm):
                 self.teleop_optimizer.step()
-            policy_loss = 0.5 * (motion_policy_loss + teleop_policy_loss)
+            policy_loss = joint_policy_loss + 0.5 * float(
+                self.cfg.get("velocity_alignment_weight", 0.1)
+            ) * alignment_loss
         else:
             policy_loss = -objective.mean()
             motion_policy_loss = policy_loss
@@ -768,6 +776,9 @@ class SuperMimicAlgorithm:
                     mixed_teleop_goals = torch.cat(
                         (initial_teleop_goal[None], torch.stack(teleop_goals)), 0
                     )
+                    critic_task_modes = torch.cat(
+                        (initial_teleop_task[None], torch.stack(next_task_modes)), 0
+                    ).bool()
                 else:
                     critic_goals = torch.cat(
                         (initial_goal[None], torch.stack(goals)), 0
@@ -794,17 +805,15 @@ class SuperMimicAlgorithm:
                         critic_states, critic_frames, critic_context, critic_goals
                     ).view(self.horizon + 1, batch_size, -1)
             if self.mixed_tasks:
-                motion_mask = ~teleop_task.bool()
-                teleop_mask = teleop_task.bool()
-                self.critic.norm.update(motion_critic_inputs[:, motion_mask])
-                self.velocity_critic.norm.update(velocity_critic_inputs[:, teleop_mask])
+                self.critic.norm.update(motion_critic_inputs[~critic_task_modes])
+                self.velocity_critic.norm.update(velocity_critic_inputs[critic_task_modes])
             else:
                 self.critic.norm.update(critic_inputs)
             with torch.no_grad():
                 if self.mixed_tasks:
                     motion_values = self.critic(motion_critic_inputs)
                     velocity_values = self.velocity_critic(velocity_critic_inputs)
-                    values = torch.where(teleop_task.bool()[None], velocity_values, motion_values)
+                    values = torch.where(critic_task_modes, velocity_values, motion_values)
                 else:
                     values = self.critic(critic_inputs)
                 target = values[-1]
@@ -817,17 +826,19 @@ class SuperMimicAlgorithm:
                     targets.append(target)
                 targets = torch.stack(targets[::-1])
             if self.mixed_tasks:
+                motion_value_mask = ~critic_task_modes[:-1]
+                teleop_value_mask = critic_task_modes[:-1]
                 motion_critic_loss = self._fit_critic(
                     self.critic,
                     self.critic_optimizer,
-                    motion_critic_inputs[:-1, motion_mask],
-                    targets[:, motion_mask],
+                    motion_critic_inputs[:-1][motion_value_mask],
+                    targets[motion_value_mask],
                 )
                 velocity_critic_loss = self._fit_critic(
                     self.velocity_critic,
                     self.velocity_critic_optimizer,
-                    velocity_critic_inputs[:-1, teleop_mask],
-                    targets[:, teleop_mask],
+                    velocity_critic_inputs[:-1][teleop_value_mask],
+                    targets[teleop_value_mask],
                 )
                 critic_loss = 0.5 * (motion_critic_loss + velocity_critic_loss)
             else:
@@ -850,15 +861,18 @@ class SuperMimicAlgorithm:
             "valid_imagined_start_ratio": self.valid_imagined_start_ratio.detach(),
         }
         if self.mixed_tasks:
-            motion = ~teleop_task.bool()
+            rollout_task_modes = torch.stack(task_modes).bool()
+            weighted_rewards = (survival * rewards).detach()
+            motion = ~rollout_task_modes
+            teleop = rollout_task_modes
             result["imagined_motion_reward"] = (
-                detached_reward_sum[motion].mean() / self.horizon / 0.1
+                weighted_rewards[motion].mean() / 0.1
                 if motion.any()
                 else torch.zeros((), device=self.device)
             )
             result["imagined_teleop_reward"] = (
-                detached_reward_sum[teleop_task.bool()].mean() / self.horizon / 0.1
-                if teleop_task.any()
+                weighted_rewards[teleop].mean() / 0.1
+                if teleop.any()
                 else torch.zeros((), device=self.device)
             )
         if self.mdp.context_layout is not None:
