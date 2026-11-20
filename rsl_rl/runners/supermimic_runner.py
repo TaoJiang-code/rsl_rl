@@ -205,6 +205,10 @@ class SuperMimicRunner:
             1, int(round(float(self.motion.cfg.recovery_window_s) / self.unwrapped.step_dt))
         )
         self.algorithm_cfg["control_dt"] = float(self.unwrapped.step_dt)
+        action_scale = torch.as_tensor(self.action_term._scale).detach().float()
+        if action_scale.ndim > 1:
+            action_scale = action_scale[0]
+        self.algorithm_cfg["action_scale"] = action_scale.flatten().cpu().tolist()
         task_switch_mean = self.unwrapped.cfg.task_switch_mean_time_s
         self.algorithm_cfg["task_switch_probability"] = (
             0.0
@@ -375,6 +379,8 @@ class SuperMimicRunner:
         columns = [
             "iteration", "wall_h", "sim_steps", "world_model_loss", "world_model_error_8",
             "policy_loss", "critic_loss", "imagined_reward", "policy_gradient_norm",
+            "self_imitation_loss", "self_imitation_positive_ratio",
+            "gradient_consistency_error", "gradient_consistency_cosine",
             "imagined_survival", "imagined_motion_reward", "imagined_teleop_reward",
             "sim_reward", "sim_motion_reward", "sim_teleop_reward",
             "episode_length", "normalized_return",
@@ -388,7 +394,8 @@ class SuperMimicRunner:
             columns[5:5] = [
                 "training_stage", "velocity_warmup_completed",
                 "motion_policy_loss", "teleop_policy_loss",
-                "alignment_loss", "motion_critic_loss", "velocity_critic_loss",
+                "alignment_loss", "switch_action_continuity_loss",
+                "motion_critic_loss", "velocity_critic_loss",
             ]
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=columns)
         if not exists:
@@ -407,6 +414,16 @@ class SuperMimicRunner:
             "critic_loss": self._mean(aggregate["critic_loss"]),
             "imagined_reward": self._mean(aggregate["imagined_reward"]),
             "policy_gradient_norm": self._mean(aggregate["policy_gradient_norm"]),
+            "self_imitation_loss": self._mean(aggregate["self_imitation_loss"]),
+            "self_imitation_positive_ratio": self._mean(
+                aggregate["self_imitation_positive_ratio"]
+            ),
+            "gradient_consistency_error": self._mean(
+                aggregate["gradient_consistency_error"]
+            ),
+            "gradient_consistency_cosine": self._mean(
+                aggregate["gradient_consistency_cosine"]
+            ),
             "imagined_survival": self._mean(aggregate["imagined_survival"]),
             "imagined_motion_reward": self._mean(aggregate["imagined_motion_reward"]),
             "imagined_teleop_reward": self._mean(aggregate["imagined_teleop_reward"]),
@@ -440,6 +457,9 @@ class SuperMimicRunner:
                     "motion_policy_loss": self._mean(aggregate["motion_policy_loss"]),
                     "teleop_policy_loss": self._mean(aggregate["teleop_policy_loss"]),
                     "alignment_loss": self._mean(aggregate["alignment_loss"]),
+                    "switch_action_continuity_loss": self._mean(
+                        aggregate["switch_action_continuity_loss"]
+                    ),
                     "motion_critic_loss": self._mean(aggregate["motion_critic_loss"]),
                     "velocity_critic_loss": self._mean(
                         aggregate["velocity_critic_loss"]
@@ -495,7 +515,10 @@ class SuperMimicRunner:
 
         aggregate = {name: [] for name in (
             "world_model_loss", "world_model_error_8", "policy_loss",
+            "self_imitation_loss", "self_imitation_positive_ratio",
+            "gradient_consistency_error", "gradient_consistency_cosine",
             "motion_policy_loss", "teleop_policy_loss", "alignment_loss",
+            "switch_action_continuity_loss",
             "critic_loss", "motion_critic_loss", "velocity_critic_loss",
             "imagined_reward", "imagined_motion_reward", "imagined_teleop_reward",
             "policy_gradient_norm", "imagined_survival",
@@ -595,5 +618,5 @@ class SuperMimicRunner:
         )
 
     def get_inference_policy(self, device: str | None = None):
-        self.algorithm.policy.eval()
-        return self.algorithm.policy.to(device or self.device)
+        policy = self.algorithm.inference_policy().eval()
+        return policy.to(device or self.device)

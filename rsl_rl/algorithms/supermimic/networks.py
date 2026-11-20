@@ -62,10 +62,21 @@ class RunningNorm(nn.Module):
 
 
 class WorldModel(nn.Module):
-    def __init__(self, robot_spec: SuperMimicRobotSpec):
+    """Deterministic dynamics with optional semi-implicit position integration."""
+
+    DRIFT_WEIGHT = 0.625
+
+    def __init__(
+        self,
+        robot_spec: SuperMimicRobotSpec,
+        structured: bool = False,
+        control_dt: float = 0.02,
+    ):
         super().__init__()
         self.num_joints = robot_spec.num_joints
         self.uses_action_history = robot_spec.uses_action_history
+        self.structured = structured
+        self.control_dt = control_dt
         action_dim = self.num_joints * (2 if self.uses_action_history else 1)
         self.input_dim = robot_spec.invariant_dim + action_dim + robot_spec.context_dim
         self.net = mlp(
@@ -79,6 +90,7 @@ class WorldModel(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
         self.in_norm = RunningNorm(self.input_dim)
         self.out_norm = RunningNorm(robot_spec.state_increment_dim, eps=1e-4)
+        self.increment_norm = RunningNorm(robot_spec.state_increment_dim, eps=1e-4)
 
     def inputs(self, state, action, normalized_context, previous_action=None):
         values = [invariant_features(state)]
@@ -90,7 +102,7 @@ class WorldModel(nn.Module):
         return torch.cat(values, -1)
 
     @staticmethod
-    def targets(state, next_state):
+    def increments(state, next_state):
         p, rotation, v, w, q, qd = state
         p1, rotation1, v1, w1, q1, qd1 = next_state
         heading = yaw_mat(rotation)
@@ -107,6 +119,36 @@ class WorldModel(nn.Module):
             -1,
         )
 
+    def _drift(self, state, next_v, next_w, next_qd):
+        _, rotation, v, w, _, qd = state
+        heading = yaw_mat(rotation)
+        old_weight = self.control_dt * (1.0 - self.DRIFT_WEIGHT)
+        new_weight = self.control_dt * self.DRIFT_WEIGHT
+        position_drift = (
+            heading.transpose(-1, -2)
+            @ (old_weight * v + new_weight * next_v).unsqueeze(-1)
+        ).squeeze(-1)
+        orientation_drift = (
+            rotation.transpose(-1, -2)
+            @ (old_weight * w + new_weight * next_w).unsqueeze(-1)
+        ).squeeze(-1)
+        joint_drift = old_weight * qd + new_weight * next_qd
+        return position_drift, orientation_drift, joint_drift
+
+    def targets(self, state, next_state):
+        increments = self.increments(state, next_state)
+        if not self.structured:
+            return increments
+        dp, dtheta, dv, dw, dq, dqd = increments.split(
+            (3, 3, 3, 3, self.num_joints, self.num_joints), -1
+        )
+        drift_p, drift_theta, drift_q = self._drift(
+            state, next_state[2], next_state[3], next_state[5]
+        )
+        return torch.cat(
+            (dp - drift_p, dtheta - drift_theta, dv, dw, dq - drift_q, dqd), -1
+        )
+
     def step(self, state, action, normalized_context, previous_action=None):
         p, rotation, v, w, q, qd = state
         output = run_mlp(
@@ -114,17 +156,29 @@ class WorldModel(nn.Module):
             self.in_norm(self.inputs(state, action, normalized_context, previous_action)),
         )
         delta = output * self.out_norm.std() + self.out_norm.mean
+        return self.integrate(state, delta)
+
+    def integrate(self, state, delta):
+        p, rotation, v, w, q, qd = state
         dp, dtheta, dv, dw, dq, dqd = delta.split(
             (3, 3, 3, 3, self.num_joints, self.num_joints), -1
         )
         heading = yaw_mat(rotation)
+        next_v = v + (rotation @ dv.unsqueeze(-1)).squeeze(-1)
+        next_w = w + (rotation @ dw.unsqueeze(-1)).squeeze(-1)
+        next_qd = qd + dqd
+        if self.structured:
+            drift_p, drift_theta, drift_q = self._drift(state, next_v, next_w, next_qd)
+            dp = dp + drift_p
+            dtheta = dtheta + drift_theta
+            dq = dq + drift_q
         return (
             p + (heading @ dp.unsqueeze(-1)).squeeze(-1),
             rotation @ so3_exp(dtheta),
-            v + (rotation @ dv.unsqueeze(-1)).squeeze(-1),
-            w + (rotation @ dw.unsqueeze(-1)).squeeze(-1),
+            next_v,
+            next_w,
             q + dq,
-            qd + dqd,
+            next_qd,
         )
 
     @staticmethod

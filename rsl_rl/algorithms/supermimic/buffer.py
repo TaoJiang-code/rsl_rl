@@ -104,8 +104,10 @@ class ReplayBuffer:
         history_envs = env[:, None].expand_as(history_rows)
         start = {
             name: self.data[name][row, env]
-            for name in ("s", "a_prev", "xi", "f", "ep_step")
+            for name in ("s", "a", "a_prev", "xi", "f", "ep_step")
         }
+        start["age"] = age
+        start["env"] = env
         for name in (
             "velocity_command",
             "velocity_time_left",
@@ -123,6 +125,23 @@ class ReplayBuffer:
             name: self.data[name][history_rows, history_envs] for name in history_names
         }
         return start, history
+
+    def forward_from(
+        self,
+        age: torch.Tensor,
+        env: torch.Tensor,
+        steps: int,
+        names: tuple[str, ...],
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Read recorded transitions forward from replay starts.
+
+        Returned tensors are time-major ``(steps, batch, ...)``. ``complete`` marks starts whose
+        entire window is still available before the replay write head.
+        """
+        ages = age[None] + torch.arange(steps, device=self.device)[:, None]
+        rows = self._row(ages.clamp(max=self.size - 1))
+        envs = env[None].expand_as(rows)
+        return {name: self.data[name][rows, envs] for name in names}, ages[-1] < self.size
 
     def sample_valid_starts(
         self,

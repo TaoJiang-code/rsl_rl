@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 from itertools import chain
@@ -33,6 +34,19 @@ class SuperMimicAlgorithm:
         self.world_model_window = int(cfg["world_model_window"])
         self.base_learning_rate = float(cfg["learning_rate"])
         self.mixed_tasks = bool(cfg.get("mixed_motion_teleop", False))
+        self.structured_world_model = bool(cfg.get("structured_world_model", False))
+        self.self_imitation_weight = float(cfg.get("self_imitation_weight", 0.0))
+        self.self_imitation_weight_cap = float(cfg.get("self_imitation_weight_cap", 5.0))
+        self.value_gradient_consistency_weight = float(
+            cfg.get("value_gradient_consistency_weight", 0.0)
+        )
+        self.value_gradient_consistency_samples = int(
+            cfg.get("value_gradient_consistency_samples", 4096)
+        )
+        self.value_gradient_consistency_epochs = int(
+            cfg.get("value_gradient_consistency_epochs", 1)
+        )
+        self.policy_ema_decay = float(cfg.get("policy_ema_decay", 0.0))
         goal_dim = self.robot_spec.goal_dim(self.goal_frames)
         teleop_goal_dim = (
             self.robot_spec.teleop_goal_dim(self.goal_frames) if self.mixed_tasks else None
@@ -40,7 +54,11 @@ class SuperMimicAlgorithm:
         critic_dim = self.robot_spec.invariant_dim + self.robot_spec.critic_extra_dim + goal_dim
 
         networks.AMP_DTYPE = torch.bfloat16 if cfg.get("amp", "bf16") == "bf16" else None
-        self.world_model = WorldModel(self.robot_spec).to(device)
+        self.world_model = WorldModel(
+            self.robot_spec,
+            structured=self.structured_world_model,
+            control_dt=float(cfg.get("control_dt", 0.02)),
+        ).to(device)
         self.policy = Policy(
             self.robot_spec.observation_dim,
             goal_dim,
@@ -49,6 +67,11 @@ class SuperMimicAlgorithm:
             teleop_goal_dim=teleop_goal_dim,
         ).to(device)
         self.critic = Critic(critic_dim).to(device)
+        self.policy_ema = None
+        if self.policy_ema_decay > 0.0:
+            self.policy_ema = copy.deepcopy(self.policy).to(device).eval()
+            self._requires_grad(self.policy_ema, False)
+        self.policy_ema_updates = 0
         self.velocity_critic = None
         if self.mixed_tasks:
             velocity_critic_dim = (
@@ -92,6 +115,39 @@ class SuperMimicAlgorithm:
             device,
             self.robot_spec,
             mixed_tasks=self.mixed_tasks,
+        )
+        action_scale = torch.as_tensor(
+            cfg.get("action_scale", [1.0] * self.robot_spec.num_joints),
+            device=device,
+            dtype=torch.float32,
+        ).flatten()
+        if action_scale.numel() == 1:
+            action_scale = action_scale.expand(self.robot_spec.num_joints).clone()
+        if action_scale.numel() != self.robot_spec.num_joints:
+            raise ValueError(
+                f"SuperMimic action_scale has {action_scale.numel()} entries, expected "
+                f"{self.robot_spec.num_joints}."
+            )
+        self.action_scale = action_scale
+        self.switch_action_continuity_weight = float(
+            cfg.get("switch_action_continuity_weight", 0.0)
+        )
+        continuity_joint_names = tuple(
+            cfg.get("switch_action_continuity_joint_names", ())
+        )
+        joint_names = tuple(self.motion.cfg.joint_names)
+        unknown_continuity_joints = sorted(
+            set(continuity_joint_names) - set(joint_names)
+        )
+        if unknown_continuity_joints:
+            raise ValueError(
+                "Unknown switch-action continuity joints: "
+                f"{unknown_continuity_joints}. Available joints: {joint_names}."
+            )
+        self.switch_action_continuity_joint_indices = torch.tensor(
+            [joint_names.index(name) for name in continuity_joint_names],
+            device=device,
+            dtype=torch.long,
         )
         self.error_floor = torch.cat(
             (
@@ -200,6 +256,7 @@ class SuperMimicAlgorithm:
             )
         )
         self.world_model.out_norm.update(self.world_model.targets(state, next_state))
+        self.world_model.increment_norm.update(self.world_model.increments(state, next_state))
 
     def _normalize_context(self, context: torch.Tensor) -> torch.Tensor:
         if self.context_norm is not None:
@@ -222,7 +279,7 @@ class SuperMimicAlgorithm:
 
     def _world_model_error(self, predicted, next_state, mask):
         target = unflatten_state(next_state)
-        std = torch.maximum(self.world_model.out_norm.std(), self.error_floor)
+        std = torch.maximum(self.world_model.increment_norm.std(), self.error_floor)
         error = (self.world_model.state_error(predicted, target) / std).square().mean(-1)
         return (error * mask).sum() / next_state.shape[0], error[:, -1]
 
@@ -295,6 +352,349 @@ class SuperMimicAlgorithm:
     def _requires_grad(module: nn.Module, enabled: bool) -> None:
         for parameter in module.parameters():
             parameter.requires_grad_(enabled)
+
+    @torch.no_grad()
+    def _update_policy_ema(self) -> None:
+        if self.policy_ema is None:
+            return
+        if self.policy_ema_updates == 0:
+            self.policy_ema.load_state_dict(self.policy.state_dict())
+        else:
+            online = list(self.policy.parameters()) + list(self.policy.buffers())
+            averaged = list(self.policy_ema.parameters()) + list(self.policy_ema.buffers())
+            for target, source in zip(averaged, online, strict=True):
+                if target.is_floating_point():
+                    target.lerp_(source.detach(), 1.0 - self.policy_ema_decay)
+                else:
+                    target.copy_(source)
+        self.policy_ema_updates += 1
+
+    def inference_policy(self) -> Policy:
+        if self.policy_ema is not None and self.policy_ema_updates > 0:
+            return self.policy_ema
+        return self.policy
+
+    @staticmethod
+    def _rotation_vee(matrix: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            (
+                matrix[..., 2, 1] - matrix[..., 1, 2],
+                matrix[..., 0, 2] - matrix[..., 2, 0],
+                matrix[..., 1, 0] - matrix[..., 0, 1],
+            ),
+            -1,
+        )
+
+    def _gradient_coordinates(self, gradients, rotation, scale):
+        parts = (
+            gradients[0],
+            self._rotation_vee(rotation.transpose(-1, -2) @ gradients[1]),
+            *gradients[2:],
+        )
+        return torch.cat([part.flatten(1) for part in parts], -1) * scale
+
+    def _gradient_scale(self, state_sequence) -> torch.Tensor:
+        p, rotation, v, w, q, qd = state_sequence
+        differences = (
+            p[1:] - p[:-1],
+            0.5 * self._rotation_vee(rotation[:-1].transpose(-1, -2) @ rotation[1:]),
+            v[1:] - v[:-1],
+            w[1:] - w[:-1],
+            q[1:] - q[:-1],
+            qd[1:] - qd[:-1],
+        )
+        return (
+            torch.cat([value.flatten(2) for value in differences], -1)
+            .flatten(0, 1)
+            .std(0)
+            .clamp_min(1.0e-6)
+        )
+
+    @torch.no_grad()
+    def _real_returns(self, start: dict[str, torch.Tensor]):
+        names = ("s1", "a", "a_prev", "xi", "f", "ep_step", "done")
+        steps = self.horizon
+        if self.mixed_tasks:
+            names += (
+                "velocity_command",
+                "teleop_task",
+                "reference_yaw_rotation",
+                "reference_translation",
+            )
+            # The extra row provides the task and command active at the bootstrap state.
+            steps += 1
+        window, complete = self.replay.forward_from(
+            start["age"],
+            start["env"],
+            steps,
+            names,
+        )
+        transition = (
+            {name: value[:-1] for name, value in window.items()}
+            if self.mixed_tasks
+            else window
+        )
+        batch_size = complete.shape[0]
+        next_state = unflatten_state(transition["s1"].flatten(0, 1))
+        next_frame = (transition["f"] + 1).flatten()
+        if self.mixed_tasks:
+            rewards = self.mdp.mixed_reward(
+                next_state,
+                next_frame,
+                transition["velocity_command"].flatten(0, 1),
+                transition["teleop_task"].flatten(),
+                transition["a"].flatten(0, 1),
+                transition["a_prev"].flatten(0, 1),
+                transition["reference_yaw_rotation"].flatten(0, 1),
+                transition["reference_translation"].flatten(0, 1),
+            ).view(self.horizon, batch_size)
+        else:
+            rewards = self.mdp.reward(
+                next_state,
+                next_frame,
+                transition["a"].flatten(0, 1),
+                transition["a_prev"].flatten(0, 1),
+            ).view(self.horizon, batch_size)
+        alive = torch.cumprod(1.0 - transition["done"].float(), 0)
+        survival = torch.cat(
+            (torch.ones(1, batch_size, device=self.device), alive[:-1]), 0
+        )
+        discount = float(self.cfg["gamma"]) ** torch.arange(
+            self.horizon, device=self.device, dtype=torch.float32
+        )[:, None]
+        final_state = unflatten_state(transition["s1"][-1])
+        final_frame = transition["f"][-1] + 1
+        final_goal = self.mdp.goal(final_frame, self.goal_frames)
+        final_context = self.mdp.advance_context(
+            transition["xi"][-1],
+            transition["ep_step"][-1].long() + 1,
+            int(self.cfg["recovery_window_steps"]),
+        )
+        normalized_final_context = self._normalize_context(final_context)
+        if self.mixed_tasks:
+            final_teleop_task = window["teleop_task"][-1].bool()
+            final_teleop_goal = self.mdp.teleop_goal(
+                final_frame,
+                self.goal_frames,
+                window["velocity_command"][-1],
+            )
+            motion_value = self.critic(
+                self.critic_input(
+                    final_state,
+                    final_frame,
+                    normalized_final_context,
+                    final_goal,
+                )
+            )
+            velocity_value = self.velocity_critic(
+                self.teleop_critic_input(
+                    final_state,
+                    normalized_final_context,
+                    final_teleop_goal,
+                    transition["a"][-1],
+                )
+            )
+            final_value = torch.where(final_teleop_task, velocity_value, motion_value)
+        else:
+            final_value = self.critic(
+                self.critic_input(
+                    final_state,
+                    final_frame,
+                    normalized_final_context,
+                    final_goal,
+                )
+            )
+        returns = (discount * survival * rewards).sum(0) + (
+            float(self.cfg["gamma"]) ** self.horizon
+        ) * alive[-1] * final_value
+        return returns, complete.float(), transition["a"][0]
+
+    def _value_gradient_targets(
+        self,
+        states,
+        rewards,
+        terminations,
+        survival,
+        bootstrap,
+        frames,
+        actions,
+        previous_actions,
+        contexts,
+        velocity_commands=None,
+        task_modes=None,
+        reference_yaw_rotations=None,
+        reference_translations=None,
+    ):
+        horizon, batch_size = rewards.shape
+        count = (horizon - 1) * batch_size
+        with torch.no_grad():
+            continuation, returns = bootstrap.detach().float(), []
+            for step in range(horizon - 1, 0, -1):
+                continuation = rewards[step].detach() + float(self.cfg["gamma"]) * (
+                    1.0 - terminations[step].detach()
+                ) * continuation
+                returns.append(continuation)
+            returns = torch.stack(returns[::-1])
+            discount = float(self.cfg["gamma"]) ** torch.arange(
+                horizon, device=self.device, dtype=torch.float32
+            )[:, None]
+            direct_reward_weight = (discount * survival.detach())[:-1].flatten()
+            direct_termination_weight = (
+                float(self.cfg["gamma"]) * discount * survival.detach()
+            )[:-1].flatten() * returns.flatten()
+            continuation_weight = (discount * survival.detach())[1:]
+
+        flat_states = tuple(
+            torch.stack([state[index] for state in states[:-1]]).flatten(0, 1)
+            for index in range(6)
+        )
+        state_leaf = tuple(value.detach().requires_grad_() for value in flat_states)
+        if self.mixed_tasks:
+            if any(
+                value is None
+                for value in (
+                    velocity_commands,
+                    task_modes,
+                    reference_yaw_rotations,
+                    reference_translations,
+                )
+            ):
+                raise RuntimeError("Mixed gradient targets require task metadata.")
+            direct_rewards, direct_terminations, _ = self.reward_termination(
+                state_leaf,
+                torch.stack(frames[:-1]).flatten(),
+                torch.stack(velocity_commands[:-1]).flatten(0, 1).detach(),
+                torch.stack(task_modes[:-1]).flatten().detach(),
+                torch.stack(actions[:-1]).flatten(0, 1).detach(),
+                torch.stack(previous_actions[:-1]).flatten(0, 1).detach(),
+                torch.stack(contexts[:-1]).flatten(0, 1).detach(),
+                torch.stack(reference_yaw_rotations[:-1]).flatten(0, 1).detach(),
+                torch.stack(reference_translations[:-1]).flatten(0, 1).detach(),
+            )
+        else:
+            direct_rewards, direct_terminations, _ = self.reward_termination(
+                state_leaf,
+                torch.stack(frames[:-1]).flatten(),
+                torch.stack(actions[:-1]).flatten(0, 1).detach(),
+                torch.stack(previous_actions[:-1]).flatten(0, 1).detach(),
+                torch.stack(contexts[:-1]).flatten(0, 1).detach(),
+            )
+        local_gradients = torch.autograd.grad(
+            (
+                direct_reward_weight * direct_rewards
+                - direct_termination_weight * direct_terminations
+            ).sum(),
+            state_leaf,
+            allow_unused=True,
+        )
+        targets = []
+        for index in range(6):
+            policy_gradients = torch.stack(
+                [
+                    state[index].grad
+                    if state[index].grad is not None
+                    else torch.zeros_like(state[index])
+                    for state in states[:-1]
+                ]
+            ).flatten(0, 1)
+            local = local_gradients[index]
+            target = -batch_size * policy_gradients - (
+                local if local is not None else torch.zeros_like(policy_gradients)
+            )
+            divisor = continuation_weight.flatten().clamp_min(1.0e-3).view(
+                -1, *([1] * (target.dim() - 1))
+            )
+            targets.append((target / divisor).detach())
+        mask = (survival.detach()[1:] > 0.5).float().flatten()
+        assert targets[0].shape[0] == count
+        return tuple(targets), mask
+
+    def _gradient_consistency_loss(
+        self,
+        critic,
+        state,
+        frame,
+        normalized_context,
+        goal,
+        previous_action,
+        teleop_task,
+        targets,
+        mask,
+        scale,
+    ):
+        state = tuple(value.detach().requires_grad_() for value in state)
+        critic_input = (
+            self.teleop_critic_input(state, normalized_context, goal, previous_action)
+            if teleop_task
+            else self.critic_input(state, frame, normalized_context, goal)
+        )
+        input_leaf = critic_input.detach().requires_grad_()
+        input_gradient = torch.autograd.grad(
+            critic(input_leaf).sum(), input_leaf, create_graph=True
+        )[0]
+        state_gradients = torch.autograd.grad(
+            critic_input,
+            state,
+            grad_outputs=input_gradient.detach(),
+            allow_unused=True,
+        )
+        state_gradients = tuple(
+            (
+                value if value is not None else torch.zeros_like(state_value)
+            ).detach().requires_grad_()
+            for value, state_value in zip(state_gradients, state, strict=True)
+        )
+        rotation = state[1].detach()
+        target_coordinates = self._gradient_coordinates(targets, rotation, scale)
+        gradient_coordinates = self._gradient_coordinates(state_gradients, rotation, scale)
+        difference = gradient_coordinates - target_coordinates
+        mask_sum = mask.sum().clamp_min(1.0)
+        denominator = (mask * target_coordinates.square().sum(-1)).sum() / mask_sum
+        relative_error = (
+            (mask * difference.square().sum(-1)).sum()
+            / mask_sum
+            / denominator.clamp_min(1.0e-12)
+        )
+        error_gradients = torch.autograd.grad(relative_error, state_gradients)
+        with torch.no_grad():
+            epsilon = 0.05 / self._gradient_coordinates(
+                error_gradients, rotation, 1.0 / scale
+            ).norm(dim=-1).clamp_min(1.0e-12)
+
+            def shifted(sign):
+                return tuple(
+                    value
+                    + sign
+                    * epsilon.view(-1, *([1] * (value.dim() - 1)))
+                    * gradient
+                    for value, gradient in zip(state, error_gradients, strict=True)
+                )
+
+            if teleop_task:
+                positive_input = self.teleop_critic_input(
+                    shifted(1.0), normalized_context, goal, previous_action
+                )
+                negative_input = self.teleop_critic_input(
+                    shifted(-1.0), normalized_context, goal, previous_action
+                )
+            else:
+                positive_input = self.critic_input(
+                    shifted(1.0), frame, normalized_context, goal
+                )
+                negative_input = self.critic_input(
+                    shifted(-1.0), frame, normalized_context, goal
+                )
+            input_direction = (positive_input - negative_input) / (2.0 * epsilon[:, None])
+            cosine = (
+                mask
+                * (gradient_coordinates * target_coordinates).sum(-1)
+                / (
+                    gradient_coordinates.norm(dim=-1)
+                    * target_coordinates.norm(dim=-1)
+                ).clamp_min(1.0e-12)
+            ).sum() / mask_sum
+        surrogate = (input_gradient * input_direction).sum()
+        return surrogate, relative_error.detach(), cosine.detach()
 
     def _critic_input(self, state, frame, normalized_context, goal):
         return torch.cat((self.mdp.critic_features(state, frame, normalized_context), goal), -1)
@@ -491,6 +891,7 @@ class SuperMimicAlgorithm:
         nn.utils.clip_grad_value_(self.policy.teleop_encoder.parameters(), 0.1)
         if torch.isfinite(gradient_norm):
             self.teleop_optimizer.step()
+        self._update_policy_ema()
         self.velocity_warmup_completed += 1
 
         zero = torch.zeros((), device=self.device)
@@ -504,6 +905,11 @@ class SuperMimicAlgorithm:
             "motion_policy_loss": zero,
             "teleop_policy_loss": alignment_loss.detach(),
             "alignment_loss": alignment_loss.detach(),
+            "switch_action_continuity_loss": zero,
+            "self_imitation_loss": zero,
+            "self_imitation_positive_ratio": zero,
+            "gradient_consistency_error": zero,
+            "gradient_consistency_cosine": zero,
             "critic_loss": zero,
             "motion_critic_loss": zero,
             "velocity_critic_loss": zero,
@@ -520,24 +926,70 @@ class SuperMimicAlgorithm:
             "soft_termination_end_effector": zero,
         }
 
-    def _fit_critic(self, critic, optimizer, inputs, targets) -> torch.Tensor:
+    def _fit_critic(
+        self,
+        critic,
+        optimizer,
+        inputs,
+        targets,
+        gradient_consistency=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat_inputs = inputs.reshape(-1, inputs.shape[-1])
         flat_targets = targets.reshape(-1)
         loss = torch.zeros((), device=self.device)
+        consistency_error = torch.zeros((), device=self.device)
+        consistency_cosine = torch.zeros((), device=self.device)
         num_minibatches = int(self.cfg["critic_minibatches"])
         minibatch_size = flat_inputs.shape[0] // num_minibatches
-        for _ in range(int(self.cfg["critic_epochs"])):
+        for epoch in range(int(self.cfg["critic_epochs"])):
             permutation = torch.randperm(flat_inputs.shape[0], device=self.device)
             for minibatch in range(num_minibatches):
                 ids = permutation[
                     minibatch * minibatch_size : (minibatch + 1) * minibatch_size
                 ]
                 loss = (critic(flat_inputs[ids]) - flat_targets[ids]).square().mean()
+                total_loss = loss
+                if (
+                    gradient_consistency is not None
+                    and epoch < self.value_gradient_consistency_epochs
+                ):
+                    (
+                        gc_state,
+                        gc_frame,
+                        gc_context,
+                        gc_goal,
+                        gc_previous_action,
+                        gc_teleop_task,
+                        gc_targets,
+                        gc_mask,
+                        gc_scale,
+                    ) = gradient_consistency
+                    count = min(self.value_gradient_consistency_samples, gc_mask.shape[0])
+                    if count > 0:
+                        gc_ids = torch.randint(0, gc_mask.shape[0], (count,), device=self.device)
+                        consistency_loss, consistency_error, consistency_cosine = (
+                            self._gradient_consistency_loss(
+                                critic,
+                                tuple(value[gc_ids] for value in gc_state),
+                                gc_frame[gc_ids],
+                                gc_context[gc_ids],
+                                gc_goal[gc_ids],
+                                gc_previous_action[gc_ids],
+                                gc_teleop_task,
+                                tuple(value[gc_ids] for value in gc_targets),
+                                gc_mask[gc_ids],
+                                gc_scale,
+                            )
+                        )
+                        total_loss = (
+                            total_loss
+                            + self.value_gradient_consistency_weight * consistency_loss
+                        )
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
+                total_loss.backward()
                 nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
                 optimizer.step()
-        return loss
+        return loss, consistency_error, consistency_cosine
 
     def policy_update(self) -> dict[str, torch.Tensor]:
         if self.in_velocity_warmup:
@@ -568,6 +1020,7 @@ class SuperMimicAlgorithm:
         initial_state = state
         context = start["xi"]
         normalized_context = self._normalize_context(context)
+        initial_normalized_context = normalized_context
         frame = start["f"]
         episode_step = start["ep_step"].long()
         previous_action = start["a_prev"]
@@ -729,8 +1182,80 @@ class SuperMimicAlgorithm:
             ) * final_survival * bootstrap
 
         alignment_loss = torch.zeros((), device=self.device)
+        switch_action_continuity_loss = torch.zeros((), device=self.device)
+        if (
+            self.mixed_tasks
+            and self.switch_action_continuity_weight > 0.0
+            and self.switch_action_continuity_joint_indices.numel() > 0
+            and self.horizon > 1
+        ):
+            rollout_task_modes = torch.stack(task_modes).bool()
+            motion_to_teleop = (~rollout_task_modes[:-1]) & rollout_task_modes[1:]
+            switch_mask = motion_to_teleop.to(rewards.dtype) * survival[1:].detach()
+            imagined_actions = torch.stack(actions)
+            continuity_indices = self.switch_action_continuity_joint_indices
+            action_delta = (
+                imagined_actions[1:, :, continuity_indices]
+                - imagined_actions[:-1, :, continuity_indices].detach()
+            ) * self.action_scale[continuity_indices]
+            switch_action_continuity_loss = (
+                switch_mask * action_delta.square().sum(-1)
+            ).sum() / switch_mask.sum().clamp_min(1.0)
+        self_imitation_loss = torch.zeros((), device=self.device)
+        self_imitation_positive_ratio = torch.zeros((), device=self.device)
+        if self.self_imitation_weight > 0.0:
+            recorded_returns, recorded_complete, recorded_action = self._real_returns(start)
+            with torch.no_grad():
+                motion_initial_value = self.critic(
+                    self.critic_input(
+                        initial_state,
+                        start["f"],
+                        initial_normalized_context,
+                        initial_goal,
+                    )
+                )
+                if self.mixed_tasks:
+                    velocity_initial_value = self.velocity_critic(
+                        self.teleop_critic_input(
+                            initial_state,
+                            initial_normalized_context,
+                            initial_teleop_goal,
+                            start["a_prev"],
+                        )
+                    )
+                    initial_value = torch.where(
+                        initial_teleop_task.bool(),
+                        velocity_initial_value,
+                        motion_initial_value,
+                    )
+                else:
+                    initial_value = motion_initial_value
+                advantage = (recorded_returns - initial_value) * recorded_complete
+                self_imitation_positive_ratio = (
+                    (advantage > 0.0).float().sum() / recorded_complete.sum().clamp_min(1.0)
+                )
+                imitation_weight = torch.clamp(
+                    advantage / (advantage.abs().mean() + 1.0e-6),
+                    0.0,
+                    self.self_imitation_weight_cap,
+                )
+            self_imitation_loss = (
+                imitation_weight
+                * (
+                    (actions[0] - recorded_action) * self.action_scale
+                ).square().mean(-1)
+            ).mean()
         motion_policy_loss = torch.zeros((), device=self.device)
         teleop_policy_loss = torch.zeros((), device=self.device)
+        gradient_targets = None
+        consistency_enabled = (
+            self.value_gradient_consistency_weight > 0.0
+            and not self.cfg.get("disable_critic", False)
+        )
+        if consistency_enabled:
+            for imagined_state in states[:-1]:
+                for value in imagined_state:
+                    value.retain_grad()
         if self.mixed_tasks:
             motion_mask = ~initial_teleop_task.bool()
             teleop_mask = initial_teleop_task.bool()
@@ -760,8 +1285,16 @@ class SuperMimicAlgorithm:
             alignment_loss = (predicted_latent - target_latent).square().mean()
             teleop_policy_loss = -objective[teleop_mask].mean() + float(
                 self.cfg.get("velocity_alignment_weight", 0.1)
-            ) * alignment_loss
-            joint_policy_loss = -objective.mean()
+            ) * alignment_loss + (
+                self.switch_action_continuity_weight
+                * switch_action_continuity_loss
+            )
+            joint_policy_loss = (
+                -objective.mean()
+                + self.self_imitation_weight * self_imitation_loss
+                + self.switch_action_continuity_weight
+                * switch_action_continuity_loss
+            )
 
             motion_parameters = list(
                 chain(self.policy.encoder.parameters(), self.policy.decoder.parameters())
@@ -769,18 +1302,26 @@ class SuperMimicAlgorithm:
             teleop_parameters = list(self.policy.teleop_encoder.parameters())
             self.policy_optimizer.zero_grad(set_to_none=True)
             self.teleop_optimizer.zero_grad(set_to_none=True)
-            motion_gradients = torch.autograd.grad(
-                joint_policy_loss, motion_parameters, retain_graph=True
-            )
-            teleop_gradients = torch.autograd.grad(
+            (
                 joint_policy_loss
-                + float(self.cfg.get("velocity_alignment_weight", 0.1)) * alignment_loss,
-                teleop_parameters,
-            )
-            for parameter, gradient in zip(motion_parameters, motion_gradients):
-                parameter.grad = gradient
-            for parameter, gradient in zip(teleop_parameters, teleop_gradients):
-                parameter.grad = gradient
+                + float(self.cfg.get("velocity_alignment_weight", 0.1)) * alignment_loss
+            ).backward()
+            if consistency_enabled:
+                gradient_targets = self._value_gradient_targets(
+                    states,
+                    rewards,
+                    terminations,
+                    survival,
+                    bootstrap,
+                    frames,
+                    actions,
+                    previous_actions,
+                    contexts[1:],
+                    velocity_commands=velocity_commands,
+                    task_modes=task_modes,
+                    reference_yaw_rotations=reference_yaw_rotations,
+                    reference_translations=reference_translations,
+                )
             motion_gradient_norm = nn.utils.clip_grad_norm_(motion_parameters, 1.0)
             teleop_gradient_norm = nn.utils.clip_grad_norm_(teleop_parameters, 1.0)
             nn.utils.clip_grad_value_(motion_parameters, 0.1)
@@ -790,18 +1331,34 @@ class SuperMimicAlgorithm:
                 self.policy_optimizer.step()
             if torch.isfinite(teleop_gradient_norm):
                 self.teleop_optimizer.step()
-            policy_loss = joint_policy_loss + 0.5 * float(
+            policy_loss = joint_policy_loss + float(
                 self.cfg.get("velocity_alignment_weight", 0.1)
             ) * alignment_loss
         else:
-            policy_loss = -objective.mean()
+            policy_loss = (
+                -objective.mean()
+                + self.self_imitation_weight * self_imitation_loss
+            )
             motion_policy_loss = policy_loss
             self.policy_optimizer.zero_grad(set_to_none=True)
             policy_loss.backward()
+            if consistency_enabled:
+                gradient_targets = self._value_gradient_targets(
+                    states,
+                    rewards,
+                    terminations,
+                    survival,
+                    bootstrap,
+                    frames,
+                    actions,
+                    previous_actions,
+                    contexts[1:],
+                )
             gradient_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             nn.utils.clip_grad_value_(self.policy.parameters(), 0.1)
             if torch.isfinite(gradient_norm):
                 self.policy_optimizer.step()
+        self._update_policy_ema()
         self._requires_grad(self.world_model, True)
         self._requires_grad(self.critic, True)
         if self.velocity_critic is not None:
@@ -810,14 +1367,17 @@ class SuperMimicAlgorithm:
         critic_loss = torch.zeros((), device=self.device)
         motion_critic_loss = torch.zeros((), device=self.device)
         velocity_critic_loss = torch.zeros((), device=self.device)
+        gradient_consistency_error = torch.zeros((), device=self.device)
+        gradient_consistency_cosine = torch.zeros((), device=self.device)
         if not self.cfg.get("disable_critic", False):
             with torch.no_grad():
-                critic_states = tuple(
+                critic_state_sequence = tuple(
                     torch.cat(
                         (initial_state[index][None], torch.stack([item[index].detach() for item in states])), 0
-                    ).flatten(0, 1)
+                    )
                     for index in range(6)
                 )
+                critic_states = tuple(value.flatten(0, 1) for value in critic_state_sequence)
                 critic_frames = torch.cat((start["f"][None], torch.stack(frames)), 0).flatten()
                 if self.mixed_tasks:
                     motion_goals = torch.cat((initial_goal[None], torch.stack(goals)), 0)
@@ -852,6 +1412,79 @@ class SuperMimicAlgorithm:
                     critic_inputs = self.critic_input(
                         critic_states, critic_frames, critic_context, critic_goals
                     ).view(self.horizon + 1, batch_size, -1)
+                gradient_consistency = None
+                motion_gradient_consistency = None
+                velocity_gradient_consistency = None
+                if gradient_targets is not None:
+                    consistency_states = tuple(
+                        value[1:-1].flatten(0, 1) for value in critic_state_sequence
+                    )
+                    consistency_frames = torch.stack(frames[:-1]).flatten()
+                    consistency_context = self._normalize_context(
+                        torch.stack(contexts[1:-1])
+                    ).flatten(0, 1)
+                    consistency_previous_actions = torch.stack(actions[:-1]).flatten(
+                        0, 1
+                    )
+                    consistency_scale = self._gradient_scale(critic_state_sequence)
+                    if self.mixed_tasks:
+                        consistency_task_modes = (
+                            torch.stack(next_task_modes[:-1]).flatten().bool()
+                        )
+                        consistency_motion_goals = torch.stack(goals[:-1]).flatten(
+                            0, 1
+                        )
+                        consistency_teleop_goals = torch.stack(
+                            teleop_goals[:-1]
+                        ).flatten(0, 1)
+                        motion_consistency_mask = ~consistency_task_modes
+                        velocity_consistency_mask = consistency_task_modes
+                        motion_gradient_consistency = (
+                            tuple(
+                                value[motion_consistency_mask]
+                                for value in consistency_states
+                            ),
+                            consistency_frames[motion_consistency_mask],
+                            consistency_context[motion_consistency_mask],
+                            consistency_motion_goals[motion_consistency_mask],
+                            consistency_previous_actions[motion_consistency_mask],
+                            False,
+                            tuple(
+                                value[motion_consistency_mask]
+                                for value in gradient_targets[0]
+                            ),
+                            gradient_targets[1][motion_consistency_mask],
+                            consistency_scale,
+                        )
+                        velocity_gradient_consistency = (
+                            tuple(
+                                value[velocity_consistency_mask]
+                                for value in consistency_states
+                            ),
+                            consistency_frames[velocity_consistency_mask],
+                            consistency_context[velocity_consistency_mask],
+                            consistency_teleop_goals[velocity_consistency_mask],
+                            consistency_previous_actions[velocity_consistency_mask],
+                            True,
+                            tuple(
+                                value[velocity_consistency_mask]
+                                for value in gradient_targets[0]
+                            ),
+                            gradient_targets[1][velocity_consistency_mask],
+                            consistency_scale,
+                        )
+                    else:
+                        gradient_consistency = (
+                            consistency_states,
+                            consistency_frames,
+                            consistency_context,
+                            torch.stack(goals[:-1]).flatten(0, 1),
+                            consistency_previous_actions,
+                            False,
+                            gradient_targets[0],
+                            gradient_targets[1],
+                            consistency_scale,
+                        )
             if self.mixed_tasks:
                 self.critic.norm.update(motion_critic_inputs[~critic_task_modes])
                 self.velocity_critic.norm.update(velocity_critic_inputs[critic_task_modes])
@@ -876,22 +1509,62 @@ class SuperMimicAlgorithm:
             if self.mixed_tasks:
                 motion_value_mask = ~critic_task_modes[:-1]
                 teleop_value_mask = critic_task_modes[:-1]
-                motion_critic_loss = self._fit_critic(
+                (
+                    motion_critic_loss,
+                    motion_consistency_error,
+                    motion_consistency_cosine,
+                ) = self._fit_critic(
                     self.critic,
                     self.critic_optimizer,
                     motion_critic_inputs[:-1][motion_value_mask],
                     targets[motion_value_mask],
+                    gradient_consistency=motion_gradient_consistency,
                 )
-                velocity_critic_loss = self._fit_critic(
+                (
+                    velocity_critic_loss,
+                    velocity_consistency_error,
+                    velocity_consistency_cosine,
+                ) = self._fit_critic(
                     self.velocity_critic,
                     self.velocity_critic_optimizer,
                     velocity_critic_inputs[:-1][teleop_value_mask],
                     targets[teleop_value_mask],
+                    gradient_consistency=velocity_gradient_consistency,
                 )
                 critic_loss = 0.5 * (motion_critic_loss + velocity_critic_loss)
+                motion_consistency_count = (
+                    motion_gradient_consistency[7].numel()
+                    if motion_gradient_consistency is not None
+                    else 0
+                )
+                velocity_consistency_count = (
+                    velocity_gradient_consistency[7].numel()
+                    if velocity_gradient_consistency is not None
+                    else 0
+                )
+                consistency_count = (
+                    motion_consistency_count + velocity_consistency_count
+                )
+                if consistency_count > 0:
+                    gradient_consistency_error = (
+                        motion_consistency_count * motion_consistency_error
+                        + velocity_consistency_count * velocity_consistency_error
+                    ) / consistency_count
+                    gradient_consistency_cosine = (
+                        motion_consistency_count * motion_consistency_cosine
+                        + velocity_consistency_count * velocity_consistency_cosine
+                    ) / consistency_count
             else:
-                critic_loss = self._fit_critic(
-                    self.critic, self.critic_optimizer, critic_inputs[:-1], targets
+                (
+                    critic_loss,
+                    gradient_consistency_error,
+                    gradient_consistency_cosine,
+                ) = self._fit_critic(
+                    self.critic,
+                    self.critic_optimizer,
+                    critic_inputs[:-1],
+                    targets,
+                    gradient_consistency=gradient_consistency,
                 )
                 motion_critic_loss = critic_loss
 
@@ -900,6 +1573,11 @@ class SuperMimicAlgorithm:
             "motion_policy_loss": motion_policy_loss.detach(),
             "teleop_policy_loss": teleop_policy_loss.detach(),
             "alignment_loss": alignment_loss.detach(),
+            "switch_action_continuity_loss": switch_action_continuity_loss.detach(),
+            "self_imitation_loss": self_imitation_loss.detach(),
+            "self_imitation_positive_ratio": self_imitation_positive_ratio.detach(),
+            "gradient_consistency_error": gradient_consistency_error.detach(),
+            "gradient_consistency_cosine": gradient_consistency_cosine.detach(),
             "critic_loss": critic_loss.detach(),
             "motion_critic_loss": motion_critic_loss.detach(),
             "velocity_critic_loss": velocity_critic_loss.detach(),
@@ -942,11 +1620,15 @@ class SuperMimicAlgorithm:
         return result
 
     def state_dict(self) -> dict:
+        inference_policy = self.inference_policy()
         state = {
             "robot_spec": self.robot_spec.to_dict(),
             "mixed_tasks": self.mixed_tasks,
+            "world_model_structured": self.structured_world_model,
             "world_model": self.world_model.state_dict(),
-            "policy": self.policy.state_dict(),
+            "policy": inference_policy.state_dict(),
+            "policy_online": self.policy.state_dict(),
+            "policy_ema_updates": self.policy_ema_updates,
             "critic": self.critic.state_dict(),
             "world_model_optimizer": self.world_model_optimizer.state_dict(),
             "policy_optimizer": self.policy_optimizer.state_dict(),
@@ -984,6 +1666,12 @@ class SuperMimicAlgorithm:
             )
         if bool(state.get("mixed_tasks", False)):
             raise ValueError("Expected a full-reference checkpoint, but received a mixed-task checkpoint.")
+        saved_structured = bool(state.get("world_model_structured", False))
+        if saved_structured != self.structured_world_model:
+            raise ValueError(
+                "Motion checkpoint world-model type does not match this run: "
+                f"checkpoint structured={saved_structured}, current={self.structured_world_model}."
+            )
         missing = {"world_model", "policy", "critic"} - state.keys()
         if missing:
             raise ValueError(
@@ -996,6 +1684,9 @@ class SuperMimicAlgorithm:
         for name in ("encoder", "decoder", "obs_norm", "goal_norm"):
             module = getattr(self.policy, name)
             module.load_state_dict(self._module_state(policy_state, f"{name}."))
+        if self.policy_ema is not None:
+            self.policy_ema.load_state_dict(self.policy.state_dict())
+            self.policy_ema_updates = 1
         self.critic.load_state_dict(state["critic"])
         saved_context_norm = state.get("context_norm")
         if self.context_norm is not None:
@@ -1017,8 +1708,18 @@ class SuperMimicAlgorithm:
                 "Checkpoint task interface does not match the current environment: "
                 f"checkpoint mixed_tasks={saved_mixed_tasks}, current={self.mixed_tasks}."
             )
+        saved_structured = bool(state.get("world_model_structured", False))
+        if saved_structured != self.structured_world_model:
+            raise ValueError(
+                "Checkpoint world-model type does not match this run: "
+                f"checkpoint structured={saved_structured}, current={self.structured_world_model}. "
+                "The structured model changes the regression target and must be trained from scratch."
+            )
         self.world_model.load_state_dict(state["world_model"])
-        self.policy.load_state_dict(state["policy"])
+        self.policy.load_state_dict(state.get("policy_online", state["policy"]))
+        if self.policy_ema is not None:
+            self.policy_ema.load_state_dict(state.get("policy", self.policy.state_dict()))
+            self.policy_ema_updates = int(state.get("policy_ema_updates", 1))
         self.critic.load_state_dict(state["critic"])
         if self.mixed_tasks:
             self.velocity_critic.load_state_dict(state["velocity_critic"])
