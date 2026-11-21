@@ -411,6 +411,12 @@ class SuperMimicAlgorithm:
         )
 
     @torch.no_grad()
+    def _next_recorded_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        """Advance replay frame ids without crossing a motion-clip boundary."""
+        clip_ids = self.motion.frame_clip_ids[frames]
+        return torch.minimum(frames + 1, self.motion.clip_ends[clip_ids])
+
+    @torch.no_grad()
     def _real_returns(self, start: dict[str, torch.Tensor]):
         names = ("s1", "a", "a_prev", "xi", "f", "ep_step", "done")
         steps = self.horizon
@@ -436,7 +442,10 @@ class SuperMimicAlgorithm:
         )
         batch_size = complete.shape[0]
         next_state = unflatten_state(transition["s1"].flatten(0, 1))
-        next_frame = (transition["f"] + 1).flatten()
+        # A replay window can cross an episode reset. Frames after that reset may
+        # already be at their clip end, so a raw +1 can index past the motion library
+        # even though their rewards are later masked by survival.
+        next_frame = self._next_recorded_frames(transition["f"]).flatten()
         if self.mixed_tasks:
             rewards = self.mdp.mixed_reward(
                 next_state,
@@ -463,7 +472,7 @@ class SuperMimicAlgorithm:
             self.horizon, device=self.device, dtype=torch.float32
         )[:, None]
         final_state = unflatten_state(transition["s1"][-1])
-        final_frame = transition["f"][-1] + 1
+        final_frame = self._next_recorded_frames(transition["f"][-1])
         final_goal = self.mdp.goal(final_frame, self.goal_frames)
         final_context = self.mdp.advance_context(
             transition["xi"][-1],
