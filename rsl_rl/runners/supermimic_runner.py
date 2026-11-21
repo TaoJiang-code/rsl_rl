@@ -433,14 +433,28 @@ class SuperMimicRunner:
             statistics["recovery_ratio"].append(
                 float((recovery_phase != 0).float().mean())
             )
-            statistics["sampling_entropy"].append(
-                float(self.motion.metrics["sampling_entropy"].mean())
+            tracking_mask = recovery_phase == 0
+            if tracking_mask.any():
+                statistics["tracking_error"].append(
+                    float(transition_info["tracking_error"][tracking_mask].mean())
+                )
+            recovery_success = transition_info["recovery_success"].bool()
+            recovery_failed = transition_info["recovery_failed"].bool()
+            statistics["recovery_success_count"].append(
+                float(recovery_success.float().sum())
             )
-            statistics["sampling_top1_probability"].append(
-                float(self.motion.metrics["sampling_top1_probability"].mean())
+            statistics["recovery_failure_count"].append(
+                float(recovery_failed.float().sum())
             )
-            statistics["sampling_active_failure_bins"].append(
-                float((self.motion.bin_failed_count > 0.0).float().mean())
+            if recovery_success.any():
+                statistics["recovery_success_time_s"].append(
+                    float(
+                        ((episode_step[recovery_success] + 1).float() * self.unwrapped.step_dt)
+                        .mean()
+                    )
+                )
+            statistics["sampling_mean_tracking_error"].append(
+                float(self.motion.metrics["sampling_mean_tracking_error"].mean())
             )
             if done.any():
                 ids = done.bool().nonzero(as_tuple=False).squeeze(-1)
@@ -472,9 +486,10 @@ class SuperMimicRunner:
             "sim_reward", "sim_motion_reward", "sim_teleop_reward",
             "episode_length", "normalized_return",
             "real_recovery_ratio", "replay_recovery_ratio", "imagined_recovery_ratio",
+            "recovery_success_rate", "recovery_success_time_s",
             "valid_imagined_start_ratio", "recovery_assist_anneal", "termination_fraction",
             "soft_termination_height", "soft_termination_tilt", "soft_termination_end_effector",
-            "sampling_entropy", "sampling_top1_probability", "sampling_active_failure_bins",
+            "tracking_error", "sampling_mean_tracking_error",
             "iterations_per_second", "learning_rate",
         ]
         if self.mixed_tasks:
@@ -491,6 +506,10 @@ class SuperMimicRunner:
 
     def _log(self, iteration: int, elapsed: float, interval_elapsed: float, stats, aggregate, learning_rate):
         termination_fraction = sum(stats["termination_count"]) / max(sum(stats["done_count"]), 1.0)
+        recovery_success_count = sum(stats["recovery_success_count"])
+        recovery_failure_count = sum(stats["recovery_failure_count"])
+        recovery_completed = recovery_success_count + recovery_failure_count
+        recovery_success_rate = recovery_success_count / max(recovery_completed, 1.0)
         row = {
             "iteration": iteration,
             "wall_h": elapsed / 3600,
@@ -523,6 +542,8 @@ class SuperMimicRunner:
             "real_recovery_ratio": self._mean(stats["recovery_ratio"]),
             "replay_recovery_ratio": self._mean(aggregate["replay_recovery_ratio"]),
             "imagined_recovery_ratio": self._mean(aggregate["imagined_recovery_ratio"]),
+            "recovery_success_rate": recovery_success_rate,
+            "recovery_success_time_s": self._mean(stats["recovery_success_time_s"]),
             "valid_imagined_start_ratio": self._mean(aggregate["valid_imagined_start_ratio"]),
             "soft_termination_height": self._mean(aggregate["soft_termination_height"]),
             "soft_termination_tilt": self._mean(aggregate["soft_termination_tilt"]),
@@ -530,9 +551,10 @@ class SuperMimicRunner:
                 aggregate["soft_termination_end_effector"]
             ),
             "recovery_assist_anneal": float(self.motion.recovery_assist_anneal),
-            "sampling_entropy": self._mean(stats["sampling_entropy"]),
-            "sampling_top1_probability": self._mean(stats["sampling_top1_probability"]),
-            "sampling_active_failure_bins": self._mean(stats["sampling_active_failure_bins"]),
+            "tracking_error": self._mean(stats["tracking_error"]),
+            "sampling_mean_tracking_error": self._mean(
+                stats["sampling_mean_tracking_error"]
+            ),
             "sim_reward": self._mean(stats["sim_reward"]),
             "sim_motion_reward": self._mean(stats["sim_motion_reward"]),
             "sim_teleop_reward": self._mean(stats["sim_teleop_reward"]),
@@ -599,8 +621,9 @@ class SuperMimicRunner:
         stats = {name: [] for name in (
             "sim_reward", "sim_motion_reward", "sim_teleop_reward",
             "episode_length", "normalized_return", "termination_count", "done_count",
-            "recovery_ratio", "sampling_entropy", "sampling_top1_probability",
-            "sampling_active_failure_bins",
+            "recovery_ratio", "recovery_success_count", "recovery_failure_count",
+            "recovery_success_time_s", "tracking_error",
+            "sampling_mean_tracking_error",
         )}
         print(f"[INFO] Filling SuperMimic replay with {warmup_steps} simulator steps.")
         self._collect(warmup_steps, stats)
