@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import torch
 import torch.nn as nn
 
@@ -209,6 +211,8 @@ class Policy(nn.Module):
         history_length: int = 10,
         latent_dim: int = 32,
         teleop_goal_dim: int | None = None,
+        gate_temperature: float = 1.0,
+        gate_history_length: int = 4,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -216,6 +220,9 @@ class Policy(nn.Module):
         self.action_dim = action_dim
         self.history_length = history_length
         self.teleop_goal_dim = teleop_goal_dim
+        self.proprio_dim = obs_dim - 6
+        self.gate_temperature = gate_temperature
+        self.gate_history_length = min(gate_history_length, history_length)
         self.encoder = mlp(goal_dim, [2048, 1024, 512, 256], latent_dim)
         self.teleop_encoder = (
             None
@@ -223,18 +230,48 @@ class Policy(nn.Module):
             else mlp(teleop_goal_dim, [2048, 1024, 512, 256], latent_dim)
         )
         self.decoder = mlp(latent_dim + obs_dim * history_length, [2048, 1024, 512, 256], action_dim)
+        self.recovery_decoder = copy.deepcopy(self.decoder)
+        self.recovery_gate = mlp(
+            self.proprio_dim * self.gate_history_length, [256, 128], 2
+        )
         with torch.no_grad():
             self.decoder[-1].weight.mul_(0.01)
             self.decoder[-1].bias.zero_()
+            self.recovery_decoder[-1].weight.copy_(self.decoder[-1].weight)
+            self.recovery_decoder[-1].bias.copy_(self.decoder[-1].bias)
+            self.recovery_gate[-1].weight.zero_()
+            self.recovery_gate[-1].bias.zero_()
         self.obs_norm = RunningNorm(obs_dim)
         self.goal_norm = RunningNorm(goal_dim)
         self.teleop_goal_norm = (
             None if teleop_goal_dim is None else RunningNorm(teleop_goal_dim)
         )
 
+    def expert_actions(
+        self, observation_history: torch.Tensor, latent: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized = self.obs_norm(observation_history)
+        decoder_input = torch.cat((latent, normalized.flatten(-2)), -1)
+        return (
+            run_mlp(self.decoder, decoder_input),
+            run_mlp(self.recovery_decoder, decoder_input),
+        )
+
+    def gate_logits(self, observation_history: torch.Tensor) -> torch.Tensor:
+        normalized = self.obs_norm(observation_history)[
+            ..., -self.gate_history_length :, : self.proprio_dim
+        ]
+        return run_mlp(self.recovery_gate, normalized.flatten(-2))
+
+    def gate_weights(self, observation_history: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(
+            self.gate_logits(observation_history) / self.gate_temperature, dim=-1
+        )
+
     def _decode(self, observation_history: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
-        observation = self.obs_norm(observation_history).flatten(-2)
-        return run_mlp(self.decoder, torch.cat((latent, observation), -1))
+        tracking, recovery = self.expert_actions(observation_history, latent)
+        weights = self.gate_weights(observation_history)
+        return weights[..., :1] * tracking + weights[..., 1:] * recovery
 
     def encode_motion(self, goal: torch.Tensor) -> torch.Tensor:
         return torch.tanh(run_mlp(self.encoder, self.goal_norm(goal)))

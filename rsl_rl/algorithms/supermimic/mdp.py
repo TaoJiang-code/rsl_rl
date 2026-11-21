@@ -58,7 +58,13 @@ class SuperMimicRobotSpec:
 
     @property
     def critic_extra_dim(self) -> int:
-        return self.num_joints + 3 * self.num_tracked_bodies + 9 + self.context_dim
+        return (
+            self.num_joints
+            + 3 * self.num_tracked_bodies
+            + 9
+            + self.context_dim
+            + self.goal_step_dim
+        )
 
     def goal_dim(self, goal_frames: int) -> int:
         return self.goal_step_dim * goal_frames
@@ -183,6 +189,11 @@ class RewardConfig:
     teleop_body_orientation_std: float = 0.4
     teleop_root_height_weight: float = 0.5
     teleop_root_height_std: float = 0.3
+    self_collision_weight: float = 0.0
+    self_collision_minimum_distance: float = 0.12
+    power_weight: float = 0.0
+    power_scale: float = 500.0
+    success_weight: float = 0.0
 
 
 class SuperMimicMDP:
@@ -197,6 +208,10 @@ class SuperMimicMDP:
         end_effector_body_names: tuple[str, ...] = (),
         teleop_body_names: tuple[str, ...] = (),
         cfg=RewardConfig(),
+        recovery_cfg: RewardConfig | None = None,
+        regularization_cfg: RewardConfig | None = None,
+        self_collision_body_pairs: tuple[tuple[str, str], ...] = (),
+        action_scale: torch.Tensor | None = None,
     ):
         self.kinematics = kinematics
         self.motion = motion
@@ -206,6 +221,8 @@ class SuperMimicMDP:
         self.soft_lower = soft_limits[..., 0]
         self.soft_upper = soft_limits[..., 1]
         self.cfg = cfg
+        self.recovery_cfg = recovery_cfg
+        self.regularization_cfg = regularization_cfg or cfg
         tracked_body_names = tuple(motion.cfg.tracked_body_names)
         missing = set(end_effector_body_names).difference(tracked_body_names)
         if missing:
@@ -217,7 +234,23 @@ class SuperMimicMDP:
         if missing_teleop:
             raise ValueError(f"SuperMimic teleop bodies are not tracked: {sorted(missing_teleop)}.")
         self.teleop_body_ids = tuple(tracked_body_names.index(name) for name in teleop_body_names)
+        missing_collision = {
+            name for pair in self_collision_body_pairs for name in pair
+        }.difference(tracked_body_names)
+        if missing_collision:
+            raise ValueError(
+                f"SuperMimic self-collision bodies are not tracked: {sorted(missing_collision)}."
+            )
+        self.self_collision_body_pairs = tuple(
+            (tracked_body_names.index(a), tracked_body_names.index(b))
+            for a, b in self_collision_body_pairs
+        )
         device = default_joint_position.device
+        self.action_scale = (
+            torch.ones_like(default_joint_position)
+            if action_scale is None
+            else action_scale.to(device=device, dtype=torch.float32)
+        )
         self.obs_noise = torch.cat(
             (
                 torch.full((robot_spec.num_joints,), 0.01),
@@ -321,6 +354,7 @@ class SuperMimicMDP:
         termination: torch.Tensor | None = None,
         reference_yaw_rotation: torch.Tensor | None = None,
         reference_translation: torch.Tensor | None = None,
+        include_regularization: bool = True,
     ):
         cfg = self.cfg
         p, rotation, v, w, q, qd = state
@@ -379,28 +413,179 @@ class SuperMimicMDP:
             + cfg.root_orientation_weight
             * torch.exp(-root_orientation_error / cfg.root_orientation_std**2)
         )
-        action_rate = (action - previous_action).square().sum(-1)
-        joint_limit = (torch.relu(q - self.soft_upper) + torch.relu(self.soft_lower - q)).sum(-1)
-        termination_penalty = (
-            torch.zeros_like(action_rate) if termination is None else termination
+        reward = tracking * CONTROL_DT
+        regularization, regularization_terms = self.regularization_reward(
+            state,
+            action,
+            previous_action,
+            context=None,
+            termination=termination,
+            return_terms=True,
         )
-        reward = (
-            tracking
-            + cfg.action_rate_weight * action_rate
-            + cfg.joint_limit_weight * joint_limit
-            + cfg.termination_penalty_weight * termination_penalty
-        ) * CONTROL_DT
+        if include_regularization:
+            reward = reward + regularization
         if return_terms:
             return reward, {
                 "tracking": tracking * CONTROL_DT,
                 "body_position_error": body_position_error,
                 "body_orientation_error": body_orientation_error,
                 "root_position_error": root_position_error,
+                **regularization_terms,
+            }
+        return reward
+
+    def regularization_reward(
+        self,
+        state,
+        action,
+        previous_action,
+        context: torch.Tensor | None,
+        termination: torch.Tensor | None = None,
+        return_terms: bool = False,
+    ):
+        cfg = self.regularization_cfg
+        _, _, _, _, q, qd = state
+        action_rate = (action - previous_action).square().sum(-1)
+        joint_limit = (torch.relu(q - self.soft_upper) + torch.relu(self.soft_lower - q)).sum(-1)
+        body_p = self.kinematics.forward(*state)[0]
+        self_collision = torch.zeros_like(action_rate)
+        if self.self_collision_body_pairs:
+            ids_a = [pair[0] for pair in self.self_collision_body_pairs]
+            ids_b = [pair[1] for pair in self.self_collision_body_pairs]
+            distances = torch.linalg.vector_norm(body_p[..., ids_a, :] - body_p[..., ids_b, :], dim=-1)
+            self_collision = torch.relu(
+                cfg.self_collision_minimum_distance - distances
+            ).square().sum(-1)
+
+        power = torch.zeros_like(action_rate)
+        if context is not None and self.context_layout is not None:
+            calibration = context[..., self.context_layout.calibration_offset]
+            stiffness = context[..., self.context_layout.stiffness]
+            damping = context[..., self.context_layout.damping]
+            effort_limit = context[..., self.context_layout.effort_limit]
+            target = self.default_joint_position + calibration + self.action_scale * action
+            torque = torch.clamp(stiffness * (target - q) - damping * qd, -effort_limit, effort_limit)
+            power = torch.relu(torque * qd).div(cfg.power_scale).square().sum(-1)
+
+        termination_penalty = torch.zeros_like(action_rate) if termination is None else termination
+        reward = (
+            cfg.action_rate_weight * action_rate
+            + cfg.joint_limit_weight * joint_limit
+            + cfg.self_collision_weight * self_collision
+            + cfg.power_weight * power
+            + cfg.termination_penalty_weight * termination_penalty
+        ) * CONTROL_DT
+        if return_terms:
+            return reward, {
                 "action_rate": action_rate,
                 "joint_limit": joint_limit,
+                "self_collision": self_collision,
+                "power": power,
                 "termination_penalty": termination_penalty,
             }
         return reward
+
+    def recovery_reward(
+        self,
+        state,
+        recovery_frame,
+        success: torch.Tensor | None = None,
+        return_terms: bool = False,
+    ):
+        if self.recovery_cfg is None:
+            raise RuntimeError("Recovery reward requested without a recovery reward config.")
+        cfg = self.recovery_cfg
+        p, rotation, v, w, q, qd = state
+        body_p, body_r, body_v, body_w = self.kinematics.forward(p, rotation, v, w, q, qd)
+        reference_p = self.motion.recovery_body_pos_w[recovery_frame, 0]
+        reference_r = quat_to_mat(self.motion.recovery_body_quat_w[recovery_frame, 0])
+        reference_body_p_raw = self.motion.recovery_body_pos_w[recovery_frame]
+        reference_body_r_raw = quat_to_mat(self.motion.recovery_body_quat_w[recovery_frame])
+        reference_body_v_raw = self.motion.recovery_body_lin_vel_w[recovery_frame]
+        reference_body_w_raw = self.motion.recovery_body_ang_vel_w[recovery_frame]
+        yaw_delta = yaw_mat(rotation @ reference_r.transpose(-1, -2))
+        anchor = torch.cat((p[..., :2], reference_p[..., 2:3]), -1)
+        reference_body_p = anchor.unsqueeze(-2) + (
+            yaw_delta.unsqueeze(-3)
+            @ (reference_body_p_raw - reference_p.unsqueeze(-2)).unsqueeze(-1)
+        ).squeeze(-1)
+        reference_body_r = yaw_delta.unsqueeze(-3) @ reference_body_r_raw
+        reference_body_v = (
+            yaw_delta.unsqueeze(-3) @ reference_body_v_raw.unsqueeze(-1)
+        ).squeeze(-1)
+        reference_body_w = (
+            yaw_delta.unsqueeze(-3) @ reference_body_w_raw.unsqueeze(-1)
+        ).squeeze(-1)
+        aligned_reference_r = yaw_delta @ reference_r
+        body_position_error = (reference_body_p - body_p).square().sum(-1).mean(-1)
+        body_orientation_error = rot_angle_sq(reference_body_r, body_r).mean(-1)
+        body_linear_velocity_error = (reference_body_v - body_v).square().sum(-1).mean(-1)
+        body_angular_velocity_error = (reference_body_w - body_w).square().sum(-1).mean(-1)
+        root_height_error = (reference_p[..., 2] - p[..., 2]).square()
+        root_orientation_error = rot_angle_sq(aligned_reference_r, rotation)
+        similarity = (
+            cfg.body_position_weight * torch.exp(-body_position_error / cfg.body_position_std**2)
+            + cfg.body_orientation_weight * torch.exp(-body_orientation_error / cfg.body_orientation_std**2)
+            + cfg.body_linear_velocity_weight
+            * torch.exp(-body_linear_velocity_error / cfg.body_linear_velocity_std**2)
+            + cfg.body_angular_velocity_weight
+            * torch.exp(-body_angular_velocity_error / cfg.body_angular_velocity_std**2)
+            + cfg.root_position_weight * torch.exp(-root_height_error / cfg.root_position_std**2)
+            + cfg.root_orientation_weight
+            * torch.exp(-root_orientation_error / cfg.root_orientation_std**2)
+        )
+        success_value = torch.zeros_like(similarity) if success is None else success.float()
+        reward = (similarity + cfg.success_weight * success_value) * CONTROL_DT
+        if return_terms:
+            return reward, {
+                "recovery_similarity": similarity * CONTROL_DT,
+                "recovery_body_position_error": body_position_error,
+                "recovery_root_height_error": root_height_error,
+                "recovery_success": success_value,
+            }
+        return reward
+
+    def recovery_root_errors(self, state, recovery_frame):
+        p, rotation, _, _, _, _ = state
+        reference_p = self.motion.recovery_body_pos_w[recovery_frame, 0]
+        reference_r = quat_to_mat(self.motion.recovery_body_quat_w[recovery_frame, 0])
+        height_error = (reference_p[..., 2] - p[..., 2]).abs()
+        tilt_error = torch.acos(
+            (reference_r[..., :, 2] * rotation[..., :, 2]).sum(-1).clamp(-1.0, 1.0)
+        )
+        return height_error, tilt_error
+
+    def regime_reward(
+        self,
+        state,
+        frame,
+        recovery_frame,
+        phase,
+        transition_alpha,
+        action,
+        previous_action,
+        context,
+        success=None,
+        termination=None,
+    ):
+        tracking = self.reward(
+            state,
+            frame,
+            action,
+            previous_action,
+            termination=termination,
+            include_regularization=False,
+        )
+        recovery = self.recovery_reward(state, recovery_frame, success=success)
+        regularization = self.regularization_reward(
+            state, action, previous_action, context, termination=termination
+        )
+        reference = torch.where(
+            phase == 1,
+            recovery,
+            torch.where(phase == 2, transition_alpha * tracking, tracking),
+        )
+        return reference + regularization
 
     def teleop_reward(
         self,
@@ -410,6 +595,7 @@ class SuperMimicMDP:
         action,
         previous_action,
         termination: torch.Tensor | None = None,
+        include_regularization: bool = True,
     ) -> torch.Tensor:
         cfg = self.cfg
         p, rotation, v, w, q, qd = state
@@ -441,7 +627,7 @@ class SuperMimicMDP:
         action_rate = (action - previous_action).square().sum(-1)
         joint_limit = (torch.relu(q - self.soft_upper) + torch.relu(self.soft_lower - q)).sum(-1)
         termination_penalty = torch.zeros_like(action_rate) if termination is None else termination
-        reward = (
+        reference_reward = (
             cfg.teleop_linear_velocity_weight
             * torch.exp(-linear_velocity_error / cfg.teleop_linear_velocity_std**2)
             + cfg.teleop_angular_velocity_weight
@@ -452,11 +638,14 @@ class SuperMimicMDP:
             * torch.exp(-body_orientation_error / cfg.teleop_body_orientation_std**2)
             + cfg.teleop_root_height_weight
             * torch.exp(-root_height_error / cfg.teleop_root_height_std**2)
-            + cfg.action_rate_weight * action_rate
+        ) * CONTROL_DT
+        if not include_regularization:
+            return reference_reward
+        return reference_reward + (
+            cfg.action_rate_weight * action_rate
             + cfg.joint_limit_weight * joint_limit
             + cfg.termination_penalty_weight * termination_penalty
         ) * CONTROL_DT
-        return reward
 
     def mixed_reward(
         self,
@@ -469,6 +658,7 @@ class SuperMimicMDP:
         reference_yaw_rotation,
         reference_translation,
         termination: torch.Tensor | None = None,
+        include_regularization: bool = True,
     ) -> torch.Tensor:
         motion_reward = self.reward(
             state,
@@ -478,6 +668,7 @@ class SuperMimicMDP:
             termination=termination,
             reference_yaw_rotation=reference_yaw_rotation,
             reference_translation=reference_translation,
+            include_regularization=include_regularization,
         )
         teleop_reward = self.teleop_reward(
             state,
@@ -486,15 +677,51 @@ class SuperMimicMDP:
             action,
             previous_action,
             termination=termination,
+            include_regularization=include_regularization,
         )
         return torch.where(teleop_task.bool(), teleop_reward, motion_reward)
 
-    def advance_context(
+    def mixed_regime_reward(
         self,
-        context: torch.Tensor,
-        episode_step: torch.Tensor,
-        recovery_window_steps: int,
-    ) -> torch.Tensor:
+        state,
+        frame,
+        recovery_frame,
+        phase,
+        transition_alpha,
+        velocity_command,
+        teleop_task,
+        action,
+        previous_action,
+        context,
+        reference_yaw_rotation,
+        reference_translation,
+        success=None,
+        termination=None,
+    ):
+        command_reward = self.mixed_reward(
+            state,
+            frame,
+            velocity_command,
+            teleop_task,
+            action,
+            previous_action,
+            reference_yaw_rotation,
+            reference_translation,
+            termination=termination,
+            include_regularization=False,
+        )
+        recovery = self.recovery_reward(state, recovery_frame, success=success)
+        regularization = self.regularization_reward(
+            state, action, previous_action, context, termination=termination
+        )
+        reference = torch.where(
+            phase == 1,
+            recovery,
+            torch.where(phase == 2, transition_alpha * command_reward, command_reward),
+        )
+        return reference + regularization
+
+    def advance_context(self, context: torch.Tensor) -> torch.Tensor:
         if self.context_layout is None:
             return context
         updated = context.clone()
@@ -502,11 +729,6 @@ class SuperMimicMDP:
         if push_velocity is not None:
             # A velocity impulse is instantaneous. It affects only the transition carrying it.
             updated[..., push_velocity] = 0.0
-        was_active = context[..., self.context_layout.recovery_active].squeeze(-1) > 0.5
-        active = was_active & (episode_step < recovery_window_steps)
-        updated[..., self.context_layout.recovery_active] = active[..., None].to(context.dtype)
-        assist = updated[..., self.context_layout.recovery_assist]
-        updated[..., self.context_layout.recovery_assist] = assist * active[..., None]
         return updated
 
     def soft_termination(
@@ -556,7 +778,14 @@ class SuperMimicMDP:
             "end_effector": body_failure * enabled,
         }
 
-    def critic_features(self, state, frame, normalized_context):
+    def critic_features(
+        self,
+        state,
+        frame,
+        normalized_context,
+        recovery_frame=None,
+        recovery_active=None,
+    ):
         p, rotation, v, w, q, qd = state
         heading_t = yaw_mat(rotation).transpose(-1, -2)
         reference_p = self.motion.body_pos_w[frame, 0]
@@ -573,6 +802,43 @@ class SuperMimicMDP:
         ).squeeze(-1).flatten(-2)
         root_error = (heading_t @ (reference_p - p).unsqueeze(-1)).squeeze(-1)
         relative_rotation = mat_to_6d(rotation.transpose(-1, -2) @ reference_r)
+        recovery_features = torch.zeros(
+            *q.shape[:-1], self.robot_spec.goal_step_dim, device=q.device, dtype=q.dtype
+        )
+        if recovery_frame is not None:
+            recovery_p = self.motion.recovery_body_pos_w[recovery_frame, 0]
+            recovery_r = quat_to_mat(self.motion.recovery_body_quat_w[recovery_frame, 0])
+            recovery_v = self.motion.recovery_body_lin_vel_w[recovery_frame, 0]
+            recovery_w = self.motion.recovery_body_ang_vel_w[recovery_frame, 0]
+            recovery_q = self.motion.recovery_joint_pos[recovery_frame]
+            recovery_qd = self.motion.recovery_joint_vel[recovery_frame]
+            recovery_yaw_delta = yaw_mat(rotation @ recovery_r.transpose(-1, -2))
+            aligned_recovery_p = torch.cat(
+                (p[..., :2], recovery_p[..., 2:3]), dim=-1
+            )
+            aligned_recovery_r = recovery_yaw_delta @ recovery_r
+            aligned_recovery_v = (
+                recovery_yaw_delta @ recovery_v.unsqueeze(-1)
+            ).squeeze(-1)
+            aligned_recovery_w = (
+                recovery_yaw_delta @ recovery_w.unsqueeze(-1)
+            ).squeeze(-1)
+            recovery_features = torch.cat(
+                (
+                    (heading_t @ (aligned_recovery_p - p).unsqueeze(-1)).squeeze(-1),
+                    mat_to_6d(rotation.transpose(-1, -2) @ aligned_recovery_r),
+                    (heading_t @ aligned_recovery_v.unsqueeze(-1)).squeeze(-1),
+                    (
+                        rotation.transpose(-1, -2)
+                        @ aligned_recovery_w.unsqueeze(-1)
+                    ).squeeze(-1),
+                    recovery_q - q,
+                    0.1 * (recovery_qd - qd),
+                ),
+                -1,
+            )
+            if recovery_active is not None:
+                recovery_features = recovery_features * recovery_active[..., None].to(q.dtype)
         return torch.cat(
             (
                 invariant_features(state),
@@ -581,6 +847,7 @@ class SuperMimicMDP:
                 root_error,
                 relative_rotation,
                 normalized_context,
+                recovery_features,
             ),
             -1,
         )

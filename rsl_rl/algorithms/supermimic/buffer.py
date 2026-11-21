@@ -27,6 +27,14 @@ class ReplayBuffer:
             "xi": ((robot_spec.context_dim,), torch.float32),
             "r": ((), torch.float32),
             "f": ((), torch.long),
+            "rf": ((), torch.long),
+            "recovery_phase": ((), torch.uint8),
+            "recovery_transition_step": ((), torch.int16),
+            "recovery_error_step": ((), torch.int16),
+            "recovery_gate_target": ((), torch.float16),
+            "recovery_gate_tracking_override": ((), torch.bool),
+            "reference_yaw_rotation": ((3, 3), torch.float16),
+            "reference_translation": ((3,), torch.float16),
             "ep_step": ((), torch.int32),
             "done": ((), torch.bool),
         }
@@ -36,8 +44,6 @@ class ReplayBuffer:
                     "velocity_command": ((3,), torch.float32),
                     "velocity_time_left": ((), torch.float32),
                     "teleop_task": ((), torch.bool),
-                    "reference_yaw_rotation": ((3, 3), torch.float32),
-                    "reference_translation": ((3,), torch.float32),
                 }
             )
         self.data = {
@@ -104,7 +110,22 @@ class ReplayBuffer:
         history_envs = env[:, None].expand_as(history_rows)
         start = {
             name: self.data[name][row, env]
-            for name in ("s", "a", "a_prev", "xi", "f", "ep_step")
+            for name in (
+                "s",
+                "a",
+                "a_prev",
+                "xi",
+                "f",
+                "rf",
+                "recovery_phase",
+                "recovery_transition_step",
+                "recovery_error_step",
+                "recovery_gate_target",
+                "recovery_gate_tracking_override",
+                "reference_yaw_rotation",
+                "reference_translation",
+                "ep_step",
+            )
         }
         start["age"] = age
         start["env"] = env
@@ -112,15 +133,10 @@ class ReplayBuffer:
             "velocity_command",
             "velocity_time_left",
             "teleop_task",
-            "reference_yaw_rotation",
-            "reference_translation",
         ):
             if name in self.data:
                 start[name] = self.data[name][row, env]
-        history_names = ["s", "a_prev", "xi", "f"]
-        for name in ("reference_yaw_rotation", "reference_translation"):
-            if name in self.data:
-                history_names.append(name)
+        history_names = ["s", "a_prev", "xi", "f", "reference_yaw_rotation"]
         history = {
             name: self.data[name][history_rows, history_envs] for name in history_names
         }
