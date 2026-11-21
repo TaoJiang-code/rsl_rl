@@ -934,6 +934,11 @@ class SuperMimicAlgorithm:
         height_error, tilt_error = self.mdp.recovery_root_errors(
             state, next_recovery_frame
         )
+        body_height_error = self.mdp.recovery_body_height_error(
+            state,
+            next_recovery_frame,
+            self.cfg["recovery_success_body_names"],
+        )
         target_error = (
             (height_error > float(self.cfg["recovery_error_height_threshold"]))
             | (tilt_error > float(self.cfg["recovery_error_tilt_threshold"]))
@@ -948,6 +953,10 @@ class SuperMimicAlgorithm:
             & (next_recovery_frame >= clip_ends)
             & (height_error <= float(self.cfg["recovery_success_height_threshold"]))
             & (tilt_error <= float(self.cfg["recovery_success_tilt_threshold"]))
+            & (
+                body_height_error
+                <= float(self.cfg["recovery_success_body_height_threshold"])
+            )
         ).detach()
 
         next_transition_step = torch.where(

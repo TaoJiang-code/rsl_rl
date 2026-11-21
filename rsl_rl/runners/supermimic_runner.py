@@ -277,6 +277,12 @@ class SuperMimicRunner:
         self.algorithm_cfg["recovery_success_tilt_threshold"] = float(
             self.motion.cfg.recovery_success_tilt_threshold
         )
+        self.algorithm_cfg["recovery_success_body_height_threshold"] = float(
+            self.motion.cfg.recovery_success_body_height_threshold
+        )
+        self.algorithm_cfg["recovery_success_body_names"] = tuple(
+            self.motion.cfg.recovery_success_body_names
+        )
         self.algorithm_cfg["control_dt"] = float(self.unwrapped.step_dt)
         self.algorithm_cfg["action_scale"] = action_scale.flatten().cpu().tolist()
         task_switch_mean = self.unwrapped.cfg.task_switch_mean_time_s

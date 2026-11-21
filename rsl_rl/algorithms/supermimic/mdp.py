@@ -485,15 +485,15 @@ class SuperMimicMDP:
             }
         return reward
 
-    def recovery_reward(
+    def recovery_similarity(
         self,
         state,
         recovery_frame,
-        success: torch.Tensor | None = None,
-        return_terms: bool = False,
+        normalized: bool = False,
+        return_errors: bool = False,
     ):
         if self.recovery_cfg is None:
-            raise RuntimeError("Recovery reward requested without a recovery reward config.")
+            raise RuntimeError("Recovery similarity requested without a recovery reward config.")
         cfg = self.recovery_cfg
         p, rotation, v, w, q, qd = state
         body_p, body_r, body_v, body_w = self.kinematics.forward(p, rotation, v, w, q, qd)
@@ -534,14 +534,49 @@ class SuperMimicMDP:
             + cfg.root_orientation_weight
             * torch.exp(-root_orientation_error / cfg.root_orientation_std**2)
         )
+        if normalized:
+            weight_sum = (
+                cfg.body_position_weight
+                + cfg.body_orientation_weight
+                + cfg.body_linear_velocity_weight
+                + cfg.body_angular_velocity_weight
+                + cfg.root_position_weight
+                + cfg.root_orientation_weight
+            )
+            similarity = similarity / max(float(weight_sum), 1.0e-8)
+        if return_errors:
+            return similarity, {
+                "recovery_body_position_error": body_position_error,
+                "recovery_body_orientation_error": body_orientation_error,
+                "recovery_body_linear_velocity_error": body_linear_velocity_error,
+                "recovery_body_angular_velocity_error": body_angular_velocity_error,
+                "recovery_root_height_error": root_height_error,
+                "recovery_root_orientation_error": root_orientation_error,
+            }
+        return similarity
+
+    def recovery_reward(
+        self,
+        state,
+        recovery_frame,
+        success: torch.Tensor | None = None,
+        return_terms: bool = False,
+    ):
+        if self.recovery_cfg is None:
+            raise RuntimeError("Recovery reward requested without a recovery reward config.")
+        cfg = self.recovery_cfg
+        similarity, errors = self.recovery_similarity(
+            state,
+            recovery_frame,
+            return_errors=True,
+        )
         success_value = torch.zeros_like(similarity) if success is None else success.float()
         reward = (similarity + cfg.success_weight * success_value) * CONTROL_DT
         if return_terms:
             return reward, {
                 "recovery_similarity": similarity * CONTROL_DT,
-                "recovery_body_position_error": body_position_error,
-                "recovery_root_height_error": root_height_error,
                 "recovery_success": success_value,
+                **errors,
             }
         return reward
 
@@ -554,6 +589,12 @@ class SuperMimicMDP:
             (reference_r[..., :, 2] * rotation[..., :, 2]).sum(-1).clamp(-1.0, 1.0)
         )
         return height_error, tilt_error
+
+    def recovery_body_height_error(self, state, recovery_frame, body_names):
+        body_ids = [self.motion.cfg.tracked_body_names.index(name) for name in body_names]
+        body_p = self.kinematics.forward(*state)[0]
+        reference_height = self.motion.recovery_body_pos_w[recovery_frame][:, body_ids, 2]
+        return (reference_height - body_p[:, body_ids, 2]).abs().mean(-1)
 
     def regime_reward(
         self,
