@@ -57,6 +57,7 @@ class RecoveryAMP:
         )
         self.updates = 0
         self.last_loss = 0.0
+        self.expert_score = self.policy_score = 0.0
         self.discriminator.requires_grad_(False)
 
     def sample_expert(self, count: int):
@@ -108,6 +109,8 @@ class RecoveryAMP:
         try:
             policy_logits = self.discriminator(torch.cat((first, second), -1))
             expert_logits = self.discriminator(torch.cat((expert, expert_next), -1))
+            self.expert_score = float(expert_logits.detach().mean())
+            self.policy_score = float(policy_logits.detach().mean())
             loss = 0.5 * (
                 F.mse_loss(policy_logits, -torch.ones_like(policy_logits))
                 + F.mse_loss(expert_logits, torch.ones_like(expert_logits))

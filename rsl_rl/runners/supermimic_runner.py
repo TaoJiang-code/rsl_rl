@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 from rsl_rl.algorithms.supermimic.algorithm import SuperMimicAlgorithm
+from rsl_rl.algorithms.supermimic.recovery_metrics import RecoveryMetrics
 from rsl_rl.algorithms.supermimic.kinematics import UrdfKinematics
 from rsl_rl.algorithms.supermimic.mdp import (
     RewardConfig,
@@ -287,6 +288,10 @@ class SuperMimicRunner:
             - math.exp(-float(self.unwrapped.step_dt) / float(task_switch_mean))
         )
         self.algorithm = SuperMimicAlgorithm(self.mdp, env.num_envs, self.algorithm_cfg, device)
+        self.recovery_metrics = RecoveryMetrics(
+            env.num_envs, device, float(self.unwrapped.step_dt),
+            self.algorithm_cfg["recovery_window_steps"], self.algorithm_cfg,
+        )
         self.observation_history = torch.zeros(
             env.num_envs,
             int(self.algorithm_cfg["history_length"]),
@@ -387,6 +392,12 @@ class SuperMimicRunner:
                 "ep_step": episode_step.to(torch.int32),
                 "done": terminated | time_outs,
             }
+            if layout is not None:
+                self.recovery_metrics.update(
+                    state, unflatten_state(transition["s1"]),
+                    context[:, layout.recovery_active].squeeze(-1), episode_step,
+                    terminated | time_outs, terminated,
+                )
             if self.mixed_tasks:
                 transition["velocity_command"] = velocity_command
                 transition["velocity_time_left"] = velocity_time_left
@@ -575,6 +586,11 @@ class SuperMimicRunner:
         for name, value in row.items():
             if name not in ("iteration", "wall_h", "sim_steps", "training_stage"):
                 self.writer.add_scalar(_TENSORBOARD_TAGS[name], value, iteration)
+        for tag, value in self.recovery_metrics.flush().items():
+            self.writer.add_scalar(tag, value, iteration)
+        if self.algorithm.recovery_amp is not None and self.algorithm.recovery_amp.updates:
+            self.writer.add_scalar("AMP/expert_score", self.algorithm.recovery_amp.expert_score, iteration)
+            self.writer.add_scalar("AMP/policy_score", self.algorithm.recovery_amp.policy_score, iteration)
         stage_text = (
             f"{row['training_stage']} "
             f"{row['velocity_warmup_completed']}/"

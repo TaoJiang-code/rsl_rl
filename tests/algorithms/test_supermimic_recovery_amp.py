@@ -257,3 +257,39 @@ def test_configured_reward_blend_and_window_mask():
     torch.testing.assert_close(blended, torch.tensor([1.51875, 2.0]))
     blended.sum().backward()
     torch.testing.assert_close(task.grad, torch.tensor([0.75, 1.0]))
+
+
+def test_recovery_metrics_completed_attempts_and_interval_boundaries():
+    from rsl_rl.algorithms.supermimic.recovery_metrics import RecoveryMetrics
+
+    metric = RecoveryMetrics(4, "cpu", 0.1, 3, {"recovery_metric_validation_s": 0.2})
+    flat = torch.zeros(4, 17)
+    flat[:, 3] = 1  # Height deliberately zero: only normal termination signals matter.
+    state = unflatten_state(flat)
+    no = torch.zeros(4, dtype=torch.bool)
+
+    def step(index, active, done=no, terminated=no):
+        metric.update(state, state, torch.tensor(active), torch.full((4,), index), done, terminated)
+
+    step(0, [True, True, True, False])
+    step(1, [True, True, True, False])
+    step(2, [True, True, True, False])
+    assert "Recovery/success_rate" not in metric.flush()
+    # First normal check fails for env 1; env 2 times out and must be excluded.
+    step(3, [False] * 4, torch.tensor([False, True, True, False]),
+         torch.tensor([False, True, False, False]))
+    result = metric.flush()
+    assert result["Recovery/evaluated_attempts"] == 1
+    assert result["Recovery/success_rate"] == 0
+    assert result["Recovery/excluded_timeouts"] == 1
+    step(4, [False] * 4)
+    result = metric.flush()
+    assert result["Recovery/evaluated_attempts"] == 1
+    assert result["Recovery/success_rate"] == 1
+    assert "Recovery/time_to_stand_s" not in result
+    step(5, [False] * 4)
+    assert "Recovery/success_rate" not in metric.flush()
+    # A new recovery can fail inside its grace window; count it exactly once.
+    step(0, [True, False, False, False], torch.tensor([True, False, False, False]),
+         torch.tensor([True, False, False, False]))
+    assert metric.flush()["Recovery/success_rate"] == 0
