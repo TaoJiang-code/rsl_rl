@@ -5,6 +5,7 @@ import torch
 
 from rsl_rl.algorithms.supermimic.algorithm import SuperMimicAlgorithm
 from rsl_rl.algorithms.supermimic.buffer import ReplayBuffer
+from rsl_rl.algorithms.supermimic.exporter import _SuperMimicExportPolicy
 from rsl_rl.algorithms.supermimic.kinematics import UrdfKinematics
 from rsl_rl.algorithms.supermimic.mdp import (
     G1_ROBOT_SPEC,
@@ -161,6 +162,36 @@ def test_mixed_policy_and_replay_dimensions():
     assert start["teleop_task"].dtype == torch.bool
     assert start["reference_yaw_rotation"].shape == (8, 3, 3)
     assert start["reference_translation"].shape == (8, 3)
+
+
+def test_export_policy_uses_recovery_gate_and_both_experts():
+    obs_dim = 8
+    history_length = 3
+    goal_dim = 5
+    action_dim = 2
+    policy = Policy(
+        obs_dim,
+        goal_dim,
+        action_dim,
+        history_length=history_length,
+        latent_dim=2,
+        gate_history_length=2,
+    )
+    with torch.no_grad():
+        for parameter in policy.parameters():
+            parameter.zero_()
+        policy.decoder[-1].bias.fill_(2.0)
+        policy.recovery_decoder[-1].bias.fill_(-3.0)
+        policy.recovery_gate[-1].bias.copy_(torch.tensor([20.0, -20.0]))
+
+    exported = _SuperMimicExportPolicy(policy)
+    history = torch.randn(4, history_length, obs_dim)
+    goal = torch.randn(4, goal_dim)
+    torch.testing.assert_close(exported(history, goal), torch.full((4, action_dim), 2.0))
+
+    with torch.no_grad():
+        exported.policy.recovery_gate[-1].bias.copy_(torch.tensor([-20.0, 20.0]))
+    torch.testing.assert_close(exported(history, goal), torch.full((4, action_dim), -3.0))
 
 
 def test_teleop_to_motion_reanchor_is_frozen_and_preserves_reference_delta():

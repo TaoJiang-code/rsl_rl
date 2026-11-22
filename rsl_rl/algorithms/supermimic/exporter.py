@@ -22,13 +22,8 @@ class _SuperMimicExportPolicy(nn.Module):
 
     def forward(self, observation_history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
         if self.interface == "motion":
-            latent = torch.tanh(self.policy.encoder(self.policy.goal_norm(goal)))
-        else:
-            latent = torch.tanh(
-                self.policy.teleop_encoder(self.policy.teleop_goal_norm(goal))
-            )
-        observation = self.policy.obs_norm(observation_history).flatten(-2)
-        return self.policy.decoder(torch.cat((latent, observation), dim=-1))
+            return self.policy(observation_history, goal)
+        return self.policy.forward_teleop(observation_history, goal)
 
 
 def export_supermimic_policy(
