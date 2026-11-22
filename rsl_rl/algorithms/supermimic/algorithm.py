@@ -47,10 +47,6 @@ class SuperMimicAlgorithm:
             cfg.get("value_gradient_consistency_epochs", 1)
         )
         self.policy_ema_decay = float(cfg.get("policy_ema_decay", 0.0))
-        self.gate_cross_entropy_weight = float(cfg.get("gate_cross_entropy_weight", 0.1))
-        self.gate_transition_weight = float(cfg.get("gate_transition_weight", 4.0))
-        self.gate_consistency_weight = float(cfg.get("gate_consistency_weight", 0.01))
-        self.gate_alignment_weight = float(cfg.get("gate_alignment_weight", 0.01))
         goal_dim = self.robot_spec.goal_dim(self.goal_frames)
         teleop_goal_dim = (
             self.robot_spec.teleop_goal_dim(self.goal_frames) if self.mixed_tasks else None
@@ -69,10 +65,15 @@ class SuperMimicAlgorithm:
             self.robot_spec.num_joints,
             self.history_length,
             teleop_goal_dim=teleop_goal_dim,
-            gate_temperature=float(cfg.get("gate_temperature", 1.0)),
-            gate_history_length=int(cfg.get("gate_history_length", 4)),
         ).to(device)
         self.critic = Critic(critic_dim).to(device)
+        self.recovery_amp = None
+        if cfg.get("recovery_amp", False):
+            from .recovery_amp import RecoveryAMP
+
+            if self.mdp.context_layout is None:
+                raise ValueError("Recovery AMP requires full physics context.")
+            self.recovery_amp = RecoveryAMP(self.motion, cfg, device)
         self.policy_ema = None
         if self.policy_ema_decay > 0.0:
             self.policy_ema = copy.deepcopy(self.policy).to(device).eval()
@@ -95,12 +96,7 @@ class SuperMimicAlgorithm:
         self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=self.base_learning_rate)
         if self.mixed_tasks:
             self.policy_optimizer = torch.optim.Adam(
-                chain(
-                    self.policy.encoder.parameters(),
-                    self.policy.decoder.parameters(),
-                    self.policy.recovery_decoder.parameters(),
-                    self.policy.recovery_gate.parameters(),
-                ),
+                chain(self.policy.encoder.parameters(), self.policy.decoder.parameters()),
                 lr=self.base_learning_rate,
                 betas=(0.9, 0.95),
             )
@@ -429,21 +425,8 @@ class SuperMimicAlgorithm:
 
     @torch.no_grad()
     def _real_returns(self, start: dict[str, torch.Tensor]):
-        names = (
-            "s1",
-            "a",
-            "a_prev",
-            "xi",
-            "r",
-            "f",
-            "rf",
-            "recovery_phase",
-            "done",
-        )
-        # The final row supplies metadata for the bootstrap state. Rewards are
-        # read from replay instead of being reconstructed: this preserves the
-        # exact tracking/recovery/transition reward selected by the environment.
-        steps = self.horizon + 1
+        names = ("s1", "a", "a_prev", "xi", "f", "ep_step", "done", "r")
+        steps = self.horizon
         if self.mixed_tasks:
             names += (
                 "velocity_command",
@@ -451,13 +434,15 @@ class SuperMimicAlgorithm:
                 "reference_yaw_rotation",
                 "reference_translation",
             )
+            # The extra row provides the task and command active at the bootstrap state.
+            steps += 1
         window, complete = self.replay.forward_from(
             start["age"],
             start["env"],
             steps,
             names,
         )
-        transition = {name: value[:-1] for name, value in window.items()}
+        transition = {name: value[:-1] for name, value in window.items()} if self.mixed_tasks else window
         batch_size = complete.shape[0]
         rewards = transition["r"].float()
         alive = torch.cumprod(1.0 - transition["done"].float(), 0)
@@ -468,12 +453,14 @@ class SuperMimicAlgorithm:
             self.horizon, device=self.device, dtype=torch.float32
         )[:, None]
         final_state = unflatten_state(transition["s1"][-1])
-        final_frame = window["f"][-1]
+        final_frame = self._next_recorded_frames(transition["f"][-1])
         final_goal = self.mdp.goal(final_frame, self.goal_frames)
-        final_context = window["xi"][-1]
+        final_context = self.mdp.advance_context(
+            transition["xi"][-1],
+            transition["ep_step"][-1].long() + 1,
+            int(self.cfg["recovery_window_steps"]),
+        )
         normalized_final_context = self._normalize_context(final_context)
-        final_recovery_frame = window["rf"][-1]
-        final_recovery_active = window["recovery_phase"][-1].long() == 1
         if self.mixed_tasks:
             final_teleop_task = window["teleop_task"][-1].bool()
             final_teleop_goal = self.mdp.teleop_goal(
@@ -487,8 +474,6 @@ class SuperMimicAlgorithm:
                     final_frame,
                     normalized_final_context,
                     final_goal,
-                    final_recovery_frame,
-                    final_recovery_active,
                 )
             )
             velocity_value = self.velocity_critic(
@@ -507,8 +492,6 @@ class SuperMimicAlgorithm:
                     final_frame,
                     normalized_final_context,
                     final_goal,
-                    final_recovery_frame,
-                    final_recovery_active,
                 )
             )
         returns = (discount * survival * rewards).sum(0) + (
@@ -531,11 +514,8 @@ class SuperMimicAlgorithm:
         task_modes=None,
         reference_yaw_rotations=None,
         reference_translations=None,
-        recovery_frames=None,
-        recovery_phases=None,
-        recovery_transition_alphas=None,
-        recovery_successes=None,
-        recovery_terminations=None,
+        amp_previous_states=None,
+        amp_contexts=None,
     ):
         horizon, batch_size = rewards.shape
         count = (horizon - 1) * batch_size
@@ -569,29 +549,12 @@ class SuperMimicAlgorithm:
                     task_modes,
                     reference_yaw_rotations,
                     reference_translations,
-                    recovery_frames,
-                    recovery_phases,
-                    recovery_transition_alphas,
-                    recovery_successes,
-                    recovery_terminations,
                 )
             ):
                 raise RuntimeError("Mixed gradient targets require task metadata.")
-            direct_frames = torch.stack(frames[:-1]).flatten()
-            direct_phases = torch.stack(recovery_phases[:-1]).flatten().detach()
-            tracking_termination = self.mdp.soft_termination(
-                state_leaf, direct_frames, None
-            ) * (direct_phases == 0).float()
-            direct_terminations = torch.maximum(
-                tracking_termination,
-                torch.stack(recovery_terminations[:-1]).flatten().detach(),
-            )
-            direct_rewards = self.mdp.mixed_regime_reward(
+            direct_rewards, direct_terminations, _ = self.reward_termination(
                 state_leaf,
-                direct_frames,
-                torch.stack(recovery_frames[:-1]).flatten().detach(),
-                direct_phases,
-                torch.stack(recovery_transition_alphas[:-1]).flatten().detach(),
+                torch.stack(frames[:-1]).flatten(),
                 torch.stack(velocity_commands[:-1]).flatten(0, 1).detach(),
                 torch.stack(task_modes[:-1]).flatten().detach(),
                 torch.stack(actions[:-1]).flatten(0, 1).detach(),
@@ -599,41 +562,26 @@ class SuperMimicAlgorithm:
                 torch.stack(contexts[:-1]).flatten(0, 1).detach(),
                 torch.stack(reference_yaw_rotations[:-1]).flatten(0, 1).detach(),
                 torch.stack(reference_translations[:-1]).flatten(0, 1).detach(),
-                success=torch.stack(recovery_successes[:-1]).flatten().detach(),
-                termination=direct_terminations,
             )
         else:
-            if any(
-                value is None
-                for value in (
-                    recovery_frames,
-                    recovery_phases,
-                    recovery_transition_alphas,
-                    recovery_successes,
-                    recovery_terminations,
-                )
-            ):
-                raise RuntimeError("Recovery-aware gradient targets require regime metadata.")
-            direct_frames = torch.stack(frames[:-1]).flatten()
-            direct_phases = torch.stack(recovery_phases[:-1]).flatten().detach()
-            tracking_termination = self.mdp.soft_termination(
-                state_leaf, direct_frames, None
-            ) * (direct_phases == 0).float()
-            direct_terminations = torch.maximum(
-                tracking_termination,
-                torch.stack(recovery_terminations[:-1]).flatten().detach(),
-            )
-            direct_rewards = self.mdp.regime_reward(
+            direct_rewards, direct_terminations, _ = self.reward_termination(
                 state_leaf,
-                direct_frames,
-                torch.stack(recovery_frames[:-1]).flatten().detach(),
-                direct_phases,
-                torch.stack(recovery_transition_alphas[:-1]).flatten().detach(),
+                torch.stack(frames[:-1]).flatten(),
                 torch.stack(actions[:-1]).flatten(0, 1).detach(),
                 torch.stack(previous_actions[:-1]).flatten(0, 1).detach(),
                 torch.stack(contexts[:-1]).flatten(0, 1).detach(),
-                success=torch.stack(recovery_successes[:-1]).flatten().detach(),
-                termination=direct_terminations,
+            )
+        if self.recovery_amp is not None:
+            if amp_previous_states is None or amp_contexts is None:
+                raise RuntimeError("AMP gradient targets require incoming transition states and contexts.")
+            previous = tuple(
+                torch.stack([s[i] for s in amp_previous_states[:-1]]).flatten(0, 1).detach() for i in range(6)
+            )
+            active = (
+                torch.stack(amp_contexts[:-1]).flatten(0, 1)[..., self.mdp.context_layout.recovery_active].squeeze(-1)
+            )
+            direct_rewards = self.recovery_amp.mix_reward(
+                direct_rewards, self.recovery_amp.reward(previous, state_leaf, active), active
             )
         local_gradients = torch.autograd.grad(
             (
@@ -674,8 +622,6 @@ class SuperMimicAlgorithm:
         goal,
         previous_action,
         teleop_task,
-        recovery_frame,
-        recovery_active,
         targets,
         mask,
         scale,
@@ -684,14 +630,7 @@ class SuperMimicAlgorithm:
         critic_input = (
             self.teleop_critic_input(state, normalized_context, goal, previous_action)
             if teleop_task
-            else self.critic_input(
-                state,
-                frame,
-                normalized_context,
-                goal,
-                recovery_frame,
-                recovery_active,
-            )
+            else self.critic_input(state, frame, normalized_context, goal)
         )
         input_leaf = critic_input.detach().requires_grad_()
         input_gradient = torch.autograd.grad(
@@ -743,22 +682,8 @@ class SuperMimicAlgorithm:
                     shifted(-1.0), normalized_context, goal, previous_action
                 )
             else:
-                positive_input = self.critic_input(
-                    shifted(1.0),
-                    frame,
-                    normalized_context,
-                    goal,
-                    recovery_frame,
-                    recovery_active,
-                )
-                negative_input = self.critic_input(
-                    shifted(-1.0),
-                    frame,
-                    normalized_context,
-                    goal,
-                    recovery_frame,
-                    recovery_active,
-                )
+                positive_input = self.critic_input(shifted(1.0), frame, normalized_context, goal)
+                negative_input = self.critic_input(shifted(-1.0), frame, normalized_context, goal)
             input_direction = (positive_input - negative_input) / (2.0 * epsilon[:, None])
             cosine = (
                 mask
@@ -771,28 +696,8 @@ class SuperMimicAlgorithm:
         surrogate = (input_gradient * input_direction).sum()
         return surrogate, relative_error.detach(), cosine.detach()
 
-    def _critic_input(
-        self,
-        state,
-        frame,
-        normalized_context,
-        goal,
-        recovery_frame=None,
-        recovery_active=None,
-    ):
-        return torch.cat(
-            (
-                self.mdp.critic_features(
-                    state,
-                    frame,
-                    normalized_context,
-                    recovery_frame=recovery_frame,
-                    recovery_active=recovery_active,
-                ),
-                goal,
-            ),
-            -1,
-        )
+    def _critic_input(self, state, frame, normalized_context, goal):
+        return torch.cat((self.mdp.critic_features(state, frame, normalized_context), goal), -1)
 
     def _teleop_critic_input(
         self,
@@ -910,120 +815,6 @@ class SuperMimicAlgorithm:
             torch.where(expired, sampled_time, next_time),
         )
 
-    def _advance_recovery_metadata(
-        self,
-        state,
-        frame,
-        recovery_frame,
-        phase,
-        transition_step,
-        error_step,
-        gate_tracking_override,
-        reference_yaw_rotation,
-        reference_translation,
-    ):
-        recovery = phase == 1
-        transition = phase == 2
-        clip_ids = self.motion.recovery_frame_clip_ids[recovery_frame]
-        clip_ends = self.motion.recovery_clip_ends[clip_ids]
-        next_recovery_frame = torch.where(
-            recovery,
-            torch.minimum(recovery_frame + 1, clip_ends),
-            recovery_frame,
-        )
-        height_error, tilt_error = self.mdp.recovery_root_errors(
-            state, next_recovery_frame
-        )
-        body_height_error = self.mdp.recovery_body_height_error(
-            state,
-            next_recovery_frame,
-            self.cfg["recovery_success_body_names"],
-        )
-        target_error = (
-            (height_error > float(self.cfg["recovery_error_height_threshold"]))
-            | (tilt_error > float(self.cfg["recovery_error_tilt_threshold"]))
-        ).detach()
-        next_error_step = torch.where(
-            recovery & target_error,
-            error_step + 1,
-            torch.zeros_like(error_step),
-        )
-        success = (
-            recovery
-            & (next_recovery_frame >= clip_ends)
-            & (height_error <= float(self.cfg["recovery_success_height_threshold"]))
-            & (tilt_error <= float(self.cfg["recovery_success_tilt_threshold"]))
-            & (
-                body_height_error
-                <= float(self.cfg["recovery_success_body_height_threshold"])
-            )
-        ).detach()
-
-        next_transition_step = torch.where(
-            transition, transition_step + 1, transition_step
-        )
-        next_transition_step = torch.where(
-            success, torch.zeros_like(next_transition_step), next_transition_step
-        )
-        next_phase = torch.where(success, torch.full_like(phase, 2), phase)
-        transition_complete = transition & (
-            next_transition_step >= int(self.cfg["recovery_transition_steps"])
-        )
-        next_phase = torch.where(transition_complete, torch.zeros_like(next_phase), next_phase)
-        next_gate_tracking_override = gate_tracking_override & ~transition_complete
-        transition_alpha = torch.where(
-            transition,
-            (
-                next_transition_step.float()
-                / float(self.cfg["recovery_transition_steps"])
-            ).clamp(0.0, 1.0),
-            torch.ones_like(next_transition_step, dtype=torch.float32),
-        )
-
-        raw_reference = self.motion.body_pos_w[frame, 0]
-        aligned_reference = (
-            reference_yaw_rotation @ raw_reference.unsqueeze(-1)
-        ).squeeze(-1)
-        recovered_translation = reference_translation.clone()
-        recovered_translation[..., :2] = state[0][..., :2] - aligned_reference[..., :2]
-        recovered_translation[..., 2] = 0.0
-        next_reference_translation = torch.where(
-            success[..., None], recovered_translation, reference_translation
-        )
-        next_gate_target = torch.where(
-            next_phase == 1,
-            torch.ones_like(transition_alpha),
-            torch.where(
-                next_phase == 2,
-                1.0
-                - (
-                    next_transition_step.float()
-                    / float(self.cfg["recovery_transition_steps"])
-                ).clamp(0.0, 1.0),
-                torch.zeros_like(transition_alpha),
-            ),
-        )
-        next_gate_target = torch.where(
-            next_gate_tracking_override,
-            torch.zeros_like(next_gate_target),
-            next_gate_target,
-        )
-        recovery_termination = recovery & (
-            next_error_step >= int(self.cfg["recovery_error_tolerance_steps"])
-        )
-        return (
-            next_recovery_frame,
-            next_phase,
-            next_transition_step,
-            next_error_step,
-            transition_alpha,
-            success,
-            recovery_termination.float(),
-            next_gate_target,
-            next_gate_tracking_override,
-            next_reference_translation,
-        )
-
     def _reward_termination(self, state, frame, action, previous_action, context):
         termination, terms = self.mdp.soft_termination(
             state, frame, context, return_terms=True
@@ -1035,7 +826,9 @@ class SuperMimicAlgorithm:
                 action,
                 previous_action,
                 termination=termination,
-            ),
+                include_regularization=False,
+            )
+            + self.mdp.regularization_reward(state, action, previous_action, context, termination=termination),
             termination,
             terms,
         )
@@ -1066,7 +859,9 @@ class SuperMimicAlgorithm:
                 reference_yaw_rotation,
                 reference_translation,
                 termination=termination,
-            ),
+                include_regularization=False,
+            )
+            + self.mdp.regularization_reward(state, action, previous_action, context, termination=termination),
             termination,
             terms,
         )
@@ -1104,16 +899,14 @@ class SuperMimicAlgorithm:
         self.velocity_warmup_completed += 1
 
         zero = torch.zeros((), device=self.device)
-        replay_recovery = (start["recovery_phase"].long() != 0).float().mean()
+        replay_recovery = zero
+        if self.mdp.context_layout is not None:
+            replay_recovery = start["xi"][..., self.mdp.context_layout.recovery_active].float().mean()
         return {
             "policy_loss": alignment_loss.detach(),
             "motion_policy_loss": zero,
             "teleop_policy_loss": alignment_loss.detach(),
             "alignment_loss": alignment_loss.detach(),
-            "gate_cross_entropy_loss": zero,
-            "gate_consistency_loss": zero,
-            "gate_alignment_loss": zero,
-            "gate_recovery_weight": zero,
             "switch_action_continuity_loss": zero,
             "self_imitation_loss": zero,
             "self_imitation_positive_ratio": zero,
@@ -1169,8 +962,6 @@ class SuperMimicAlgorithm:
                         gc_goal,
                         gc_previous_action,
                         gc_teleop_task,
-                        gc_recovery_frame,
-                        gc_recovery_active,
                         gc_targets,
                         gc_mask,
                         gc_scale,
@@ -1187,8 +978,6 @@ class SuperMimicAlgorithm:
                                 gc_goal[gc_ids],
                                 gc_previous_action[gc_ids],
                                 gc_teleop_task,
-                                gc_recovery_frame[gc_ids],
-                                gc_recovery_active[gc_ids],
                                 tuple(value[gc_ids] for value in gc_targets),
                                 gc_mask[gc_ids],
                                 gc_scale,
@@ -1242,13 +1031,6 @@ class SuperMimicAlgorithm:
         teleop_task = start.get("teleop_task")
         reference_yaw_rotation = start["reference_yaw_rotation"].float()
         reference_translation = start["reference_translation"].float()
-        recovery_frame = start["rf"]
-        recovery_phase = start["recovery_phase"].long()
-        recovery_transition_step = start["recovery_transition_step"].long()
-        recovery_error_step = start["recovery_error_step"].long()
-        recovery_gate_tracking_override = start[
-            "recovery_gate_tracking_override"
-        ].bool()
         initial_teleop_task = teleop_task
         with torch.no_grad():
             observation_history = self.mdp.observation(
@@ -1288,35 +1070,9 @@ class SuperMimicAlgorithm:
         next_task_modes = []
         reference_yaw_rotations = []
         reference_translations = []
-        recovery_frames = []
-        recovery_phases = []
-        next_recovery_phases = []
-        recovery_transition_alphas = []
-        recovery_successes = []
-        recovery_terminations = []
-        gate_targets = []
-        gate_weights = []
-        tracking_expert_actions = []
-        recovery_expert_actions = []
         contexts = [context]
         for _ in range(self.horizon):
             previous_actions.append(previous_action)
-            step_recovery_phase = recovery_phase
-            motion_latent = self.policy.encode_motion(goal)
-            if self.mixed_tasks:
-                teleop_latent = self.policy.encode_teleop(teleop_goal)
-                latent = torch.where(
-                    teleop_task.bool().unsqueeze(-1), teleop_latent, motion_latent
-                )
-            else:
-                latent = motion_latent
-            tracking_expert, recovery_expert = self.policy.expert_actions(
-                observation_history, latent
-            )
-            gate_weights.append(self.policy.gate_weights(observation_history))
-            tracking_expert_actions.append(tracking_expert)
-            recovery_expert_actions.append(recovery_expert)
-            gate_targets.append(start["recovery_gate_target"].float() if not gate_targets else next_gate_target)
             if self.mixed_tasks:
                 velocity_commands.append(velocity_command)
                 task_modes.append(teleop_task)
@@ -1361,73 +1117,25 @@ class SuperMimicAlgorithm:
                     goal,
                     previous_action,
                 )
-                reference_yaw_rotations.append(reference_yaw_rotation)
-                reference_translations.append(reference_translation)
-            (
-                recovery_frame,
-                recovery_phase,
-                recovery_transition_step,
-                recovery_error_step,
-                recovery_transition_alpha,
-                recovery_success,
-                recovery_termination,
-                next_gate_target,
-                recovery_gate_tracking_override,
-                reference_translation,
-            ) = self._advance_recovery_metadata(
-                state,
-                frame,
-                recovery_frame,
-                step_recovery_phase,
-                recovery_transition_step,
-                recovery_error_step,
-                recovery_gate_tracking_override,
-                reference_yaw_rotation,
-                reference_translation,
-            )
-            recovery_frames.append(recovery_frame)
-            recovery_phases.append(step_recovery_phase)
-            next_recovery_phases.append(recovery_phase)
-            recovery_transition_alphas.append(recovery_transition_alpha)
-            recovery_successes.append(recovery_success)
-            recovery_terminations.append(recovery_termination)
             states.append(state)
             actions.append(previous_action)
             frames.append(frame)
             goals.append(goal)
             episode_step = episode_step + 1
-            context = self.mdp.advance_context(context)
-            if self.mdp.context_layout is not None:
-                context[..., self.mdp.context_layout.recovery_active] = (
-                    recovery_phase != 0
-                )[..., None].to(context.dtype)
+            context = self.mdp.advance_context(
+                context,
+                episode_step,
+                int(self.cfg["recovery_window_steps"]),
+            )
             normalized_context = self._normalize_context(context)
             contexts.append(context)
 
         flatten = lambda values: torch.stack(values).flatten(0, 1)  # noqa: E731
         all_states = tuple(flatten([state_at_time[index] for state_at_time in states]) for index in range(6))
-        tracking_termination, termination_terms = self.mdp.soft_termination(
-            all_states,
-            flatten(frames),
-            None,
-            return_terms=True,
-        )
-        flat_phases = flatten(recovery_phases)
-        tracking_mask = (flat_phases == 0).float()
-        tracking_termination = tracking_termination * tracking_mask
-        termination_terms = {
-            name: value * tracking_mask for name, value in termination_terms.items()
-        }
-        terminations = torch.maximum(
-            tracking_termination, flatten(recovery_terminations)
-        )
         if self.mixed_tasks:
-            rewards = self.mdp.mixed_regime_reward(
+            rewards, terminations, termination_terms = self.reward_termination(
                 all_states,
                 flatten(frames),
-                flatten(recovery_frames),
-                flat_phases,
-                flatten(recovery_transition_alphas),
                 flatten(velocity_commands),
                 flatten(task_modes),
                 flatten(actions),
@@ -1435,21 +1143,21 @@ class SuperMimicAlgorithm:
                 flatten(contexts[1:]),
                 flatten(reference_yaw_rotations),
                 flatten(reference_translations),
-                success=flatten(recovery_successes),
-                termination=terminations,
             )
         else:
-            rewards = self.mdp.regime_reward(
+            rewards, terminations, termination_terms = self.reward_termination(
                 all_states,
                 flatten(frames),
-                flatten(recovery_frames),
-                flat_phases,
-                flatten(recovery_transition_alphas),
                 flatten(actions),
                 flatten(previous_actions),
                 flatten(contexts[1:]),
-                success=flatten(recovery_successes),
-                termination=terminations,
+            )
+        if self.recovery_amp is not None:
+            prior_states = [initial_state] + states[:-1]
+            prior_flat = tuple(flatten([s[i] for s in prior_states]) for i in range(6))
+            active = flatten(contexts[:-1])[..., self.mdp.context_layout.recovery_active].squeeze(-1)
+            rewards = self.recovery_amp.mix_reward(
+                rewards, self.recovery_amp.reward(prior_flat, all_states, active), active
             )
         rewards = rewards.view(self.horizon, batch_size)
         terminations = terminations.view(self.horizon, batch_size)
@@ -1463,16 +1171,7 @@ class SuperMimicAlgorithm:
         detached_reward_sum = (survival * rewards).detach().sum(0)
         if not self.cfg.get("disable_critic", False):
             if self.mixed_tasks:
-                motion_bootstrap = self.critic(
-                    self.critic_input(
-                        state,
-                        frame,
-                        normalized_context,
-                        goal,
-                        recovery_frame,
-                        recovery_phase == 1,
-                    )
-                )
+                motion_bootstrap = self.critic(self.critic_input(state, frame, normalized_context, goal))
                 velocity_bootstrap = self.velocity_critic(
                     self.teleop_critic_input(
                         state, normalized_context, teleop_goal, previous_action
@@ -1482,71 +1181,10 @@ class SuperMimicAlgorithm:
                     teleop_task.bool(), velocity_bootstrap, motion_bootstrap
                 )
             else:
-                bootstrap = self.critic(
-                    self.critic_input(
-                        state,
-                        frame,
-                        normalized_context,
-                        goal,
-                        recovery_frame,
-                        recovery_phase == 1,
-                    )
-                )
+                bootstrap = self.critic(self.critic_input(state, frame, normalized_context, goal))
             objective = objective + (
                 float(self.cfg["gamma"]) ** self.horizon
             ) * final_survival * bootstrap
-
-        stacked_gate_weights = torch.stack(gate_weights)
-        stacked_gate_targets = torch.stack(gate_targets).clamp(0.0, 1.0)
-        gate_target_distribution = torch.stack(
-            (1.0 - stacked_gate_targets, stacked_gate_targets), dim=-1
-        )
-        gate_cross_entropy_per_step = -(
-            gate_target_distribution * stacked_gate_weights.clamp_min(1.0e-6).log()
-        ).sum(-1)
-        transition_gate_mask = (
-            (stacked_gate_targets > 1.0e-4) & (stacked_gate_targets < 1.0 - 1.0e-4)
-        )
-        gate_step_weight = torch.where(
-            transition_gate_mask,
-            torch.full_like(stacked_gate_targets, self.gate_transition_weight),
-            torch.ones_like(stacked_gate_targets),
-        ) * survival.detach()
-        gate_cross_entropy_loss = (
-            gate_step_weight * gate_cross_entropy_per_step
-        ).sum() / gate_step_weight.sum().clamp_min(1.0)
-
-        gate_consistency_loss = torch.zeros((), device=self.device)
-        if self.horizon > 1:
-            tracking_pair = (stacked_gate_targets[:-1] <= 1.0e-4) & (
-                stacked_gate_targets[1:] <= 1.0e-4
-            )
-            recovery_pair = (stacked_gate_targets[:-1] >= 1.0 - 1.0e-4) & (
-                stacked_gate_targets[1:] >= 1.0 - 1.0e-4
-            )
-            consistency_mask = (
-                (tracking_pair | recovery_pair).float() * survival[1:].detach()
-            )
-            gate_delta = stacked_gate_weights[1:] - stacked_gate_weights[:-1]
-            gate_consistency_loss = (
-                consistency_mask * gate_delta.square().sum(-1)
-            ).sum() / consistency_mask.sum().clamp_min(1.0)
-
-        gate_alignment_loss = torch.zeros((), device=self.device)
-        transition_alignment_mask = transition_gate_mask.float() * survival.detach()
-        if transition_alignment_mask.any():
-            expert_delta = (
-                torch.stack(tracking_expert_actions)
-                - torch.stack(recovery_expert_actions)
-            ) * self.action_scale
-            gate_alignment_loss = (
-                transition_alignment_mask * expert_delta.square().mean(-1)
-            ).sum() / transition_alignment_mask.sum().clamp_min(1.0)
-        gate_auxiliary_loss = (
-            self.gate_cross_entropy_weight * gate_cross_entropy_loss
-            + self.gate_consistency_weight * gate_consistency_loss
-            + self.gate_alignment_weight * gate_alignment_loss
-        )
 
         alignment_loss = torch.zeros((), device=self.device)
         switch_action_continuity_loss = torch.zeros((), device=self.device)
@@ -1579,8 +1217,6 @@ class SuperMimicAlgorithm:
                         start["f"],
                         initial_normalized_context,
                         initial_goal,
-                        start["rf"],
-                        start["recovery_phase"].long() == 1,
                     )
                 )
                 if self.mixed_tasks:
@@ -1661,19 +1297,11 @@ class SuperMimicAlgorithm:
             joint_policy_loss = (
                 -objective.mean()
                 + self.self_imitation_weight * self_imitation_loss
-                + gate_auxiliary_loss
                 + self.switch_action_continuity_weight
                 * switch_action_continuity_loss
             )
 
-            motion_parameters = list(
-                chain(
-                    self.policy.encoder.parameters(),
-                    self.policy.decoder.parameters(),
-                    self.policy.recovery_decoder.parameters(),
-                    self.policy.recovery_gate.parameters(),
-                )
-            )
+            motion_parameters = list(chain(self.policy.encoder.parameters(), self.policy.decoder.parameters()))
             teleop_parameters = list(self.policy.teleop_encoder.parameters())
             self.policy_optimizer.zero_grad(set_to_none=True)
             self.teleop_optimizer.zero_grad(set_to_none=True)
@@ -1696,11 +1324,8 @@ class SuperMimicAlgorithm:
                     task_modes=task_modes,
                     reference_yaw_rotations=reference_yaw_rotations,
                     reference_translations=reference_translations,
-                    recovery_frames=recovery_frames,
-                    recovery_phases=recovery_phases,
-                    recovery_transition_alphas=recovery_transition_alphas,
-                    recovery_successes=recovery_successes,
-                    recovery_terminations=recovery_terminations,
+                    amp_previous_states=prior_states if self.recovery_amp is not None else None,
+                    amp_contexts=contexts[:-1] if self.recovery_amp is not None else None,
                 )
             motion_gradient_norm = nn.utils.clip_grad_norm_(motion_parameters, 1.0)
             teleop_gradient_norm = nn.utils.clip_grad_norm_(teleop_parameters, 1.0)
@@ -1718,7 +1343,6 @@ class SuperMimicAlgorithm:
             policy_loss = (
                 -objective.mean()
                 + self.self_imitation_weight * self_imitation_loss
-                + gate_auxiliary_loss
             )
             motion_policy_loss = policy_loss
             self.policy_optimizer.zero_grad(set_to_none=True)
@@ -1734,11 +1358,8 @@ class SuperMimicAlgorithm:
                     actions,
                     previous_actions,
                     contexts[1:],
-                    recovery_frames=recovery_frames,
-                    recovery_phases=recovery_phases,
-                    recovery_transition_alphas=recovery_transition_alphas,
-                    recovery_successes=recovery_successes,
-                    recovery_terminations=recovery_terminations,
+                    amp_previous_states=prior_states if self.recovery_amp is not None else None,
+                    amp_contexts=contexts[:-1] if self.recovery_amp is not None else None,
                 )
             gradient_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             nn.utils.clip_grad_value_(self.policy.parameters(), 0.1)
@@ -1778,24 +1399,12 @@ class SuperMimicAlgorithm:
                         (initial_goal[None], torch.stack(goals)), 0
                     ).flatten(0, 1)
                 critic_context = self._normalize_context(torch.stack(contexts)).flatten(0, 1)
-                critic_recovery_frames = torch.cat(
-                    (start["rf"][None], torch.stack(recovery_frames)), 0
-                ).flatten()
-                critic_recovery_active = torch.cat(
-                    (
-                        (start["recovery_phase"].long() == 1)[None],
-                        (torch.stack(next_recovery_phases) == 1),
-                    ),
-                    0,
-                ).flatten()
                 if self.mixed_tasks:
                     motion_critic_inputs = self.critic_input(
                         critic_states,
                         critic_frames,
                         critic_context,
                         motion_goals.flatten(0, 1),
-                        critic_recovery_frames,
-                        critic_recovery_active,
                     ).view(self.horizon + 1, batch_size, -1)
                     critic_previous_actions = torch.cat(
                         (start["a_prev"][None], torch.stack(actions)), 0
@@ -1807,14 +1416,9 @@ class SuperMimicAlgorithm:
                         critic_previous_actions,
                     ).view(self.horizon + 1, batch_size, -1)
                 else:
-                    critic_inputs = self.critic_input(
-                        critic_states,
-                        critic_frames,
-                        critic_context,
-                        critic_goals,
-                        critic_recovery_frames,
-                        critic_recovery_active,
-                    ).view(self.horizon + 1, batch_size, -1)
+                    critic_inputs = self.critic_input(critic_states, critic_frames, critic_context, critic_goals).view(
+                        self.horizon + 1, batch_size, -1
+                    )
                 gradient_consistency = None
                 motion_gradient_consistency = None
                 velocity_gradient_consistency = None
@@ -1828,12 +1432,6 @@ class SuperMimicAlgorithm:
                     ).flatten(0, 1)
                     consistency_previous_actions = torch.stack(actions[:-1]).flatten(
                         0, 1
-                    )
-                    consistency_recovery_frames = torch.stack(
-                        recovery_frames[:-1]
-                    ).flatten()
-                    consistency_recovery_active = (
-                        torch.stack(next_recovery_phases[:-1]).flatten() == 1
                     )
                     consistency_scale = self._gradient_scale(critic_state_sequence)
                     if self.mixed_tasks:
@@ -1858,8 +1456,6 @@ class SuperMimicAlgorithm:
                             consistency_motion_goals[motion_consistency_mask],
                             consistency_previous_actions[motion_consistency_mask],
                             False,
-                            consistency_recovery_frames[motion_consistency_mask],
-                            consistency_recovery_active[motion_consistency_mask],
                             tuple(
                                 value[motion_consistency_mask]
                                 for value in gradient_targets[0]
@@ -1877,8 +1473,6 @@ class SuperMimicAlgorithm:
                             consistency_teleop_goals[velocity_consistency_mask],
                             consistency_previous_actions[velocity_consistency_mask],
                             True,
-                            consistency_recovery_frames[velocity_consistency_mask],
-                            consistency_recovery_active[velocity_consistency_mask],
                             tuple(
                                 value[velocity_consistency_mask]
                                 for value in gradient_targets[0]
@@ -1894,8 +1488,6 @@ class SuperMimicAlgorithm:
                             torch.stack(goals[:-1]).flatten(0, 1),
                             consistency_previous_actions,
                             False,
-                            consistency_recovery_frames,
-                            consistency_recovery_active,
                             gradient_targets[0],
                             gradient_targets[1],
                             consistency_scale,
@@ -1948,14 +1540,10 @@ class SuperMimicAlgorithm:
                 )
                 critic_loss = 0.5 * (motion_critic_loss + velocity_critic_loss)
                 motion_consistency_count = (
-                    motion_gradient_consistency[9].numel()
-                    if motion_gradient_consistency is not None
-                    else 0
+                    motion_gradient_consistency[7].numel() if motion_gradient_consistency is not None else 0
                 )
                 velocity_consistency_count = (
-                    velocity_gradient_consistency[9].numel()
-                    if velocity_gradient_consistency is not None
-                    else 0
+                    velocity_gradient_consistency[7].numel() if velocity_gradient_consistency is not None else 0
                 )
                 consistency_count = (
                     motion_consistency_count + velocity_consistency_count
@@ -1988,10 +1576,6 @@ class SuperMimicAlgorithm:
             "motion_policy_loss": motion_policy_loss.detach(),
             "teleop_policy_loss": teleop_policy_loss.detach(),
             "alignment_loss": alignment_loss.detach(),
-            "gate_cross_entropy_loss": gate_cross_entropy_loss.detach(),
-            "gate_consistency_loss": gate_consistency_loss.detach(),
-            "gate_alignment_loss": gate_alignment_loss.detach(),
-            "gate_recovery_weight": stacked_gate_weights[..., 1].mean().detach(),
             "switch_action_continuity_loss": switch_action_continuity_loss.detach(),
             "self_imitation_loss": self_imitation_loss.detach(),
             "self_imitation_positive_ratio": self_imitation_positive_ratio.detach(),
@@ -2020,12 +1604,17 @@ class SuperMimicAlgorithm:
                 if teleop.any()
                 else torch.zeros((), device=self.device)
             )
-        result["replay_recovery_ratio"] = (
-            (start["recovery_phase"].long() != 0).float().mean().detach()
-        )
-        result["imagined_recovery_ratio"] = (
-            (torch.stack(next_recovery_phases) != 0).float().mean().detach()
-        )
+        if self.mdp.context_layout is not None:
+            result["replay_recovery_ratio"] = (
+                start["xi"][..., self.mdp.context_layout.recovery_active].float().mean().detach()
+            )
+            result["imagined_recovery_ratio"] = (
+                torch.stack(contexts[1:])[..., self.mdp.context_layout.recovery_active].float().mean().detach()
+            )
+        else:
+            zero = torch.zeros((), device=self.device)
+            result["replay_recovery_ratio"] = zero
+            result["imagined_recovery_ratio"] = zero
         result["soft_termination_height"] = termination_terms["height"].mean().detach()
         result["soft_termination_tilt"] = termination_terms["tilt"].mean().detach()
         result["soft_termination_end_effector"] = (
@@ -2036,6 +1625,8 @@ class SuperMimicAlgorithm:
     def state_dict(self) -> dict:
         inference_policy = self.inference_policy()
         state = {
+            "training_schema": "single_decoder_recovery_amp_v2",
+            "recovery_amp": None if self.recovery_amp is None else self.recovery_amp.state_dict(),
             "robot_spec": self.robot_spec.to_dict(),
             "mixed_tasks": self.mixed_tasks,
             "world_model_structured": self.structured_world_model,
@@ -2072,6 +1663,8 @@ class SuperMimicAlgorithm:
     def initialize_from_motion_checkpoint(self, state: dict) -> None:
         if not self.mixed_tasks:
             raise RuntimeError("Motion checkpoint initialization is only used by mixed training.")
+        if state.get("training_schema") != "single_decoder_recovery_amp_v2":
+            raise ValueError("Checkpoint training architecture differs. Start a new run after the recovery cleanup.")
         saved_spec = state.get("robot_spec")
         if saved_spec is not None and saved_spec != self.robot_spec.to_dict():
             raise ValueError(
@@ -2093,6 +1686,10 @@ class SuperMimicAlgorithm:
                 f"{sorted(missing)}."
             )
 
+        if self.recovery_amp is not None:
+            if state.get("recovery_amp") is None:
+                raise ValueError("Checkpoint is missing AMP discriminator state.")
+            self.recovery_amp.load_state_dict(state["recovery_amp"], load_optimizers=False)
         self.world_model.load_state_dict(state["world_model"])
         policy_state = state["policy"]
         for name in ("encoder", "decoder", "obs_norm", "goal_norm"):
@@ -2111,6 +1708,8 @@ class SuperMimicAlgorithm:
         self.velocity_warmup_completed = 0
 
     def load_state_dict(self, state: dict, load_optimizers: bool = True) -> None:
+        if state.get("training_schema") != "single_decoder_recovery_amp_v2":
+            raise ValueError("Checkpoint training architecture differs. Start a new run after the recovery cleanup.")
         saved_spec = state.get("robot_spec")
         if saved_spec is not None and saved_spec != self.robot_spec.to_dict():
             raise ValueError(
@@ -2129,6 +1728,10 @@ class SuperMimicAlgorithm:
                 f"checkpoint structured={saved_structured}, current={self.structured_world_model}. "
                 "The structured model changes the regression target and must be trained from scratch."
             )
+        if self.recovery_amp is not None:
+            if state.get("recovery_amp") is None:
+                raise ValueError("Checkpoint is missing AMP discriminator state.")
+            self.recovery_amp.load_state_dict(state["recovery_amp"], load_optimizers=load_optimizers)
         self.world_model.load_state_dict(state["world_model"])
         self.policy.load_state_dict(state.get("policy_online", state["policy"]))
         if self.policy_ema is not None:

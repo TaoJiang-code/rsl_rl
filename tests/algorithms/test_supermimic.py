@@ -39,6 +39,15 @@ TRACKED_BODIES = [
 ]
 
 
+def add_tracking_transition(replay, transition):
+    batch = replay.num_envs
+    metadata = {
+        "reference_yaw_rotation": torch.eye(3).expand(batch, -1, -1).clone(),
+        "reference_translation": torch.zeros(batch, 3),
+    }
+    replay.add({**metadata, **transition})
+
+
 def test_state_and_rotation_round_trip():
     rotation_vector = torch.randn(32, 3) * 0.3
     rotation = so3_exp(rotation_vector)
@@ -56,13 +65,20 @@ def test_state_and_rotation_round_trip():
 def test_replay_window_masks_episode_boundaries():
     replay = ReplayBuffer(time_steps=8, num_envs=2, device="cpu", robot_spec=G1_ROBOT_SPEC)
     for step in range(6):
-        replay.add({
-            "s": torch.zeros(2, 71), "s1": torch.zeros(2, 71),
-            "a": torch.zeros(2, 29), "a_prev": torch.zeros(2, 29),
-            "xi": torch.zeros(2, 33), "r": torch.zeros(2),
-            "f": torch.full((2,), step), "ep_step": torch.full((2,), step, dtype=torch.int32),
-            "done": torch.tensor([step == 2, False]),
-        })
+        add_tracking_transition(
+            replay,
+            {
+                "s": torch.zeros(2, 71),
+                "s1": torch.zeros(2, 71),
+                "a": torch.zeros(2, 29),
+                "a_prev": torch.zeros(2, 29),
+                "xi": torch.zeros(2, 33),
+                "r": torch.zeros(2),
+                "f": torch.full((2,), step),
+                "ep_step": torch.full((2,), step, dtype=torch.int32),
+                "done": torch.tensor([step == 2, False]),
+            },
+        )
     sample = replay.sample_windows(64, 4)
     assert sample["s"].shape == (64, 4, 71)
     assert sample["a_prev"].shape == (64, 4, 29)
@@ -74,13 +90,20 @@ def test_replay_samples_only_full_horizon_starts():
     replay = ReplayBuffer(time_steps=4, num_envs=2, device="cpu", robot_spec=G1_ROBOT_SPEC)
     frames = (0, 3, 4, 7)
     for step, frame in enumerate(frames):
-        replay.add({
-            "s": torch.zeros(2, 71), "s1": torch.zeros(2, 71),
-            "a": torch.zeros(2, 29), "a_prev": torch.zeros(2, 29),
-            "xi": torch.zeros(2, 33), "r": torch.zeros(2),
-            "f": torch.full((2,), frame), "ep_step": torch.full((2,), step, dtype=torch.int32),
-            "done": torch.zeros(2, dtype=torch.bool),
-        })
+        add_tracking_transition(
+            replay,
+            {
+                "s": torch.zeros(2, 71),
+                "s1": torch.zeros(2, 71),
+                "a": torch.zeros(2, 29),
+                "a_prev": torch.zeros(2, 29),
+                "xi": torch.zeros(2, 33),
+                "r": torch.zeros(2),
+                "f": torch.full((2,), frame),
+                "ep_step": torch.full((2,), step, dtype=torch.int32),
+                "done": torch.zeros(2, dtype=torch.bool),
+            },
+        )
     frame_clip_ids = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
     clip_ends = torch.tensor([4, 9])
     start, history, valid_ratio = replay.sample_valid_starts(
@@ -155,43 +178,13 @@ def test_mixed_policy_and_replay_dimensions():
         "reference_yaw_rotation": torch.eye(3).expand(batch, -1, -1).clone(),
         "reference_translation": torch.zeros(batch, 3),
     }
-    replay.add(transition)
+    add_tracking_transition(replay, transition)
     start, _ = replay.sample_starts(8, history_length=10)
     assert start["velocity_command"].shape == (8, 3)
     assert start["velocity_time_left"].shape == (8,)
     assert start["teleop_task"].dtype == torch.bool
     assert start["reference_yaw_rotation"].shape == (8, 3, 3)
     assert start["reference_translation"].shape == (8, 3)
-
-
-def test_export_policy_uses_recovery_gate_and_both_experts():
-    obs_dim = 8
-    history_length = 3
-    goal_dim = 5
-    action_dim = 2
-    policy = Policy(
-        obs_dim,
-        goal_dim,
-        action_dim,
-        history_length=history_length,
-        latent_dim=2,
-        gate_history_length=2,
-    )
-    with torch.no_grad():
-        for parameter in policy.parameters():
-            parameter.zero_()
-        policy.decoder[-1].bias.fill_(2.0)
-        policy.recovery_decoder[-1].bias.fill_(-3.0)
-        policy.recovery_gate[-1].bias.copy_(torch.tensor([20.0, -20.0]))
-
-    exported = _SuperMimicExportPolicy(policy)
-    history = torch.randn(4, history_length, obs_dim)
-    goal = torch.randn(4, goal_dim)
-    torch.testing.assert_close(exported(history, goal), torch.full((4, action_dim), 2.0))
-
-    with torch.no_grad():
-        exported.policy.recovery_gate[-1].bias.copy_(torch.tensor([-20.0, 20.0]))
-    torch.testing.assert_close(exported(history, goal), torch.full((4, action_dim), -3.0))
 
 
 def test_teleop_to_motion_reanchor_is_frozen_and_preserves_reference_delta():
@@ -373,6 +366,9 @@ def test_reward_applies_soft_termination_penalty_with_control_dt():
     mdp.soft_lower = torch.full((1,), -1.0)
     mdp.soft_upper = torch.full((1,), 1.0)
     mdp.cfg = RewardConfig(termination_penalty_weight=-1.0)
+    mdp.regularization_cfg = mdp.cfg
+    mdp.self_collision_body_pairs = ()
+    mdp.context_layout = None
     state = (
         torch.zeros(2, 3),
         torch.eye(3).expand(2, -1, -1),

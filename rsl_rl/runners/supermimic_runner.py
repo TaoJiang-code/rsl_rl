@@ -20,6 +20,51 @@ from rsl_rl.algorithms.supermimic.mdp import (
 )
 
 
+# TensorBoard groups follow the shared task logger; CSV column names remain stable.
+_TENSORBOARD_TAGS = {
+    "world_model_loss": "Loss/world_model_loss",
+    "policy_loss": "Loss/policy_loss",
+    "critic_loss": "Loss/critic_loss",
+    "self_imitation_loss": "Loss/self_imitation_loss",
+    "motion_policy_loss": "Loss/motion_policy_loss",
+    "teleop_policy_loss": "Loss/teleop_policy_loss",
+    "alignment_loss": "Loss/alignment_loss",
+    "switch_action_continuity_loss": "Loss/switch_action_continuity_loss",
+    "motion_critic_loss": "Loss/motion_critic_loss",
+    "velocity_critic_loss": "Loss/velocity_critic_loss",
+    "learning_rate": "Loss/learning_rate",
+    "sim_reward": "Train/sim_reward",
+    "sim_motion_reward": "Train/sim_motion_reward",
+    "sim_teleop_reward": "Train/sim_teleop_reward",
+    "episode_length": "Train/episode_length",
+    "normalized_return": "Train/normalized_return",
+    "velocity_warmup_completed": "Train/velocity_warmup_completed",
+    "policy_gradient_norm": "Policy/policy_gradient_norm",
+    "self_imitation_positive_ratio": "Policy/self_imitation_positive_ratio",
+    "gradient_consistency_error": "Policy/gradient_consistency_error",
+    "gradient_consistency_cosine": "Policy/gradient_consistency_cosine",
+    "world_model_error_8": "WorldModel/world_model_error_8",
+    "imagined_reward": "Imagination/imagined_reward",
+    "imagined_motion_reward": "Imagination/imagined_motion_reward",
+    "imagined_teleop_reward": "Imagination/imagined_teleop_reward",
+    "imagined_survival": "Imagination/imagined_survival",
+    "valid_imagined_start_ratio": "Imagination/valid_imagined_start_ratio",
+    "real_recovery_ratio": "Recovery/real_recovery_ratio",
+    "replay_recovery_ratio": "Recovery/replay_recovery_ratio",
+    "imagined_recovery_ratio": "Recovery/imagined_recovery_ratio",
+    "recovery_assist_anneal": "Recovery/recovery_assist_anneal",
+    "termination_fraction": "Termination/termination_fraction",
+    "soft_termination_height": "Termination/soft_termination_height",
+    "soft_termination_tilt": "Termination/soft_termination_tilt",
+    "soft_termination_end_effector": "Termination/soft_termination_end_effector",
+    "tracking_error": "Tracking/tracking_error",
+    "sampling_mean_tracking_error": "Sampling/sampling_mean_tracking_error",
+    "recovery_amp_loss": "AMP/recovery_amp_loss",
+    "recovery_amp_reward": "AMP/recovery_amp_reward",
+    "iterations_per_second": "Perf/iterations_per_second",
+}
+
+
 class SuperMimicRunner:
     """Collect real transitions, fit dynamics, and optimize the policy through imagined rollouts."""
 
@@ -197,34 +242,6 @@ class SuperMimicRunner:
             teleop_root_height_weight=weight(teleop_root_height_cfg, 0.0),
             teleop_root_height_std=std(teleop_root_height_cfg, 0.3),
         )
-        recovery_rewards_cfg = getattr(self.unwrapped.cfg, "recovery_rewards", None)
-        recovery_reward_cfg = None
-        if recovery_rewards_cfg is not None:
-            recovery_reward_cfg = RewardConfig(
-                body_position_weight=weight(recovery_rewards_cfg.body_position, 0.0),
-                body_position_std=std(recovery_rewards_cfg.body_position, 0.3),
-                body_orientation_weight=weight(recovery_rewards_cfg.body_orientation, 0.0),
-                body_orientation_std=std(recovery_rewards_cfg.body_orientation, 0.4),
-                body_linear_velocity_weight=weight(
-                    recovery_rewards_cfg.body_linear_velocity, 0.0
-                ),
-                body_linear_velocity_std=std(
-                    recovery_rewards_cfg.body_linear_velocity, 1.0
-                ),
-                body_angular_velocity_weight=weight(
-                    recovery_rewards_cfg.body_angular_velocity, 0.0
-                ),
-                body_angular_velocity_std=std(
-                    recovery_rewards_cfg.body_angular_velocity, 3.14
-                ),
-                root_position_weight=weight(recovery_rewards_cfg.root_height, 0.0),
-                root_position_std=std(recovery_rewards_cfg.root_height, 0.3),
-                root_orientation_weight=weight(
-                    recovery_rewards_cfg.root_orientation, 0.0
-                ),
-                root_orientation_std=std(recovery_rewards_cfg.root_orientation, 0.4),
-                success_weight=weight(recovery_rewards_cfg.success, 0.0),
-            )
         regularization_reward_cfg = RewardConfig(
             action_rate_weight=weight(action_smoothness_cfg, 0.0),
             joint_limit_weight=weight(joint_limit_cfg, 0.0),
@@ -253,35 +270,12 @@ class SuperMimicRunner:
             end_effector_body_names=end_effector_body_names,
             teleop_body_names=teleop_body_names,
             cfg=reward_cfg,
-            recovery_cfg=recovery_reward_cfg,
             regularization_cfg=regularization_reward_cfg,
             self_collision_body_pairs=self_collision_body_pairs,
             action_scale=action_scale.flatten(),
         )
-        self.algorithm_cfg["recovery_transition_steps"] = max(
-            1, int(round(float(self.motion.cfg.recovery_transition_s) / self.unwrapped.step_dt))
-        )
-        self.algorithm_cfg["recovery_error_tolerance_steps"] = max(
-            1,
-            int(round(float(self.motion.cfg.recovery_error_tolerance_s) / self.unwrapped.step_dt)),
-        )
-        self.algorithm_cfg["recovery_error_height_threshold"] = float(
-            self.motion.cfg.recovery_error_height_threshold
-        )
-        self.algorithm_cfg["recovery_error_tilt_threshold"] = float(
-            self.motion.cfg.recovery_error_tilt_threshold
-        )
-        self.algorithm_cfg["recovery_success_height_threshold"] = float(
-            self.motion.cfg.recovery_success_height_threshold
-        )
-        self.algorithm_cfg["recovery_success_tilt_threshold"] = float(
-            self.motion.cfg.recovery_success_tilt_threshold
-        )
-        self.algorithm_cfg["recovery_success_body_height_threshold"] = float(
-            self.motion.cfg.recovery_success_body_height_threshold
-        )
-        self.algorithm_cfg["recovery_success_body_names"] = tuple(
-            self.motion.cfg.recovery_success_body_names
+        self.algorithm_cfg["recovery_window_steps"] = max(
+            1, round(self.motion.cfg.recovery_window_s / self.unwrapped.step_dt)
         )
         self.algorithm_cfg["control_dt"] = float(self.unwrapped.step_dt)
         self.algorithm_cfg["action_scale"] = action_scale.flatten().cpu().tolist()
@@ -327,14 +321,6 @@ class SuperMimicRunner:
             state = unflatten_state(state_flat)
             context = self.unwrapped.refresh_supermimic_context().clone()
             frame = self.motion.time_steps.clone()
-            recovery_frame = self.motion.recovery_time_steps.clone()
-            recovery_phase = self.motion.recovery_phase.clone()
-            recovery_transition_step = self.motion.recovery_transition_steps.clone()
-            recovery_error_step = self.motion.recovery_error_steps.clone()
-            recovery_gate_target = self.motion.recovery_gate_target.clone()
-            recovery_gate_tracking_override = (
-                self.motion.recovery_gate_tracking_override.clone()
-            )
             previous_action = self.action_term.raw_actions.clone()
             episode_step = self.unwrapped.episode_length_buf.clone()
             reference_yaw_rotation = self.motion.reference_yaw_rotation.clone()
@@ -396,12 +382,6 @@ class SuperMimicRunner:
                 "xi": context,
                 "r": reward,
                 "f": frame,
-                "rf": recovery_frame,
-                "recovery_phase": recovery_phase.to(torch.uint8),
-                "recovery_transition_step": recovery_transition_step.to(torch.int16),
-                "recovery_error_step": recovery_error_step.to(torch.int16),
-                "recovery_gate_target": recovery_gate_target.to(torch.float16),
-                "recovery_gate_tracking_override": recovery_gate_tracking_override,
                 "reference_yaw_rotation": reference_yaw_rotation.to(torch.float16),
                 "reference_translation": reference_translation.to(torch.float16),
                 "ep_step": episode_step.to(torch.int32),
@@ -411,6 +391,14 @@ class SuperMimicRunner:
                 transition["velocity_command"] = velocity_command
                 transition["velocity_time_left"] = velocity_time_left
                 transition["teleop_task"] = teleop_task
+            if self.algorithm.recovery_amp is not None:
+                active = context[:, self.unwrapped.supermimic_context_layout.recovery_active].squeeze(-1)
+                style = self.algorithm.recovery_amp.reward(state, unflatten_state(transition["s1"]), active)
+                statistics["recovery_amp_reward"].append(
+                    float(style[active > 0].mean()) if (active > 0).any() else 0.0
+                )
+                reward = self.algorithm.recovery_amp.mix_reward(reward, style, active)
+                transition["r"] = reward
             self.algorithm.replay.add(transition)
             self.algorithm.update_normalizers(
                 transition,
@@ -430,28 +418,16 @@ class SuperMimicRunner:
                     statistics["sim_teleop_reward"].append(
                         float(reward[teleop_task].mean() / 0.1)
                     )
-            statistics["recovery_ratio"].append(
-                float((recovery_phase != 0).float().mean())
+            recovery_active = (
+                context[:, self.unwrapped.supermimic_context_layout.recovery_active].squeeze(-1) > 0
+                if self.unwrapped.supermimic_context_layout is not None
+                else torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
             )
-            tracking_mask = recovery_phase == 0
+            statistics["recovery_ratio"].append(float(recovery_active.float().mean()))
+            tracking_mask = ~recovery_active
             if tracking_mask.any():
                 statistics["tracking_error"].append(
                     float(transition_info["tracking_error"][tracking_mask].mean())
-                )
-            recovery_success = transition_info["recovery_success"].bool()
-            recovery_failed = transition_info["recovery_failed"].bool()
-            statistics["recovery_success_count"].append(
-                float(recovery_success.float().sum())
-            )
-            statistics["recovery_failure_count"].append(
-                float(recovery_failed.float().sum())
-            )
-            if recovery_success.any():
-                statistics["recovery_success_time_s"].append(
-                    float(
-                        ((episode_step[recovery_success] + 1).float() * self.unwrapped.step_dt)
-                        .mean()
-                    )
                 )
             statistics["sampling_mean_tracking_error"].append(
                 float(self.motion.metrics["sampling_mean_tracking_error"].mean())
@@ -476,21 +452,40 @@ class SuperMimicRunner:
         exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
         self._csv_file = open(csv_path, "a", newline="", encoding="utf-8")
         columns = [
-            "iteration", "wall_h", "sim_steps", "world_model_loss", "world_model_error_8",
-            "policy_loss", "critic_loss", "imagined_reward", "policy_gradient_norm",
-            "self_imitation_loss", "self_imitation_positive_ratio",
-            "gradient_consistency_error", "gradient_consistency_cosine",
-            "gate_cross_entropy_loss", "gate_consistency_loss",
-            "gate_alignment_loss", "gate_recovery_weight",
-            "imagined_survival", "imagined_motion_reward", "imagined_teleop_reward",
-            "sim_reward", "sim_motion_reward", "sim_teleop_reward",
-            "episode_length", "normalized_return",
-            "real_recovery_ratio", "replay_recovery_ratio", "imagined_recovery_ratio",
-            "recovery_success_rate", "recovery_success_time_s",
-            "valid_imagined_start_ratio", "recovery_assist_anneal", "termination_fraction",
-            "soft_termination_height", "soft_termination_tilt", "soft_termination_end_effector",
-            "tracking_error", "sampling_mean_tracking_error",
-            "iterations_per_second", "learning_rate",
+            "iteration",
+            "wall_h",
+            "sim_steps",
+            "world_model_loss",
+            "world_model_error_8",
+            "policy_loss",
+            "critic_loss",
+            "imagined_reward",
+            "policy_gradient_norm",
+            "self_imitation_loss",
+            "self_imitation_positive_ratio",
+            "gradient_consistency_error",
+            "gradient_consistency_cosine",
+            "imagined_survival",
+            "imagined_motion_reward",
+            "imagined_teleop_reward",
+            "sim_reward",
+            "sim_motion_reward",
+            "sim_teleop_reward",
+            "episode_length",
+            "normalized_return",
+            "real_recovery_ratio",
+            "replay_recovery_ratio",
+            "imagined_recovery_ratio",
+            "valid_imagined_start_ratio",
+            "recovery_assist_anneal",
+            "termination_fraction",
+            "soft_termination_height",
+            "soft_termination_tilt",
+            "soft_termination_end_effector",
+            "tracking_error",
+            "sampling_mean_tracking_error",
+            "iterations_per_second",
+            "learning_rate",
         ]
         if self.mixed_tasks:
             columns[5:5] = [
@@ -499,6 +494,8 @@ class SuperMimicRunner:
                 "alignment_loss", "switch_action_continuity_loss",
                 "motion_critic_loss", "velocity_critic_loss",
             ]
+        if self.algorithm.recovery_amp is not None:
+            columns += ["recovery_amp_loss", "recovery_amp_reward"]
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=columns)
         if not exists:
             self._csv_writer.writeheader()
@@ -506,10 +503,6 @@ class SuperMimicRunner:
 
     def _log(self, iteration: int, elapsed: float, interval_elapsed: float, stats, aggregate, learning_rate):
         termination_fraction = sum(stats["termination_count"]) / max(sum(stats["done_count"]), 1.0)
-        recovery_success_count = sum(stats["recovery_success_count"])
-        recovery_failure_count = sum(stats["recovery_failure_count"])
-        recovery_completed = recovery_success_count + recovery_failure_count
-        recovery_success_rate = recovery_success_count / max(recovery_completed, 1.0)
         row = {
             "iteration": iteration,
             "wall_h": elapsed / 3600,
@@ -530,20 +523,12 @@ class SuperMimicRunner:
             "gradient_consistency_cosine": self._mean(
                 aggregate["gradient_consistency_cosine"]
             ),
-            "gate_cross_entropy_loss": self._mean(
-                aggregate["gate_cross_entropy_loss"]
-            ),
-            "gate_consistency_loss": self._mean(aggregate["gate_consistency_loss"]),
-            "gate_alignment_loss": self._mean(aggregate["gate_alignment_loss"]),
-            "gate_recovery_weight": self._mean(aggregate["gate_recovery_weight"]),
             "imagined_survival": self._mean(aggregate["imagined_survival"]),
             "imagined_motion_reward": self._mean(aggregate["imagined_motion_reward"]),
             "imagined_teleop_reward": self._mean(aggregate["imagined_teleop_reward"]),
             "real_recovery_ratio": self._mean(stats["recovery_ratio"]),
             "replay_recovery_ratio": self._mean(aggregate["replay_recovery_ratio"]),
             "imagined_recovery_ratio": self._mean(aggregate["imagined_recovery_ratio"]),
-            "recovery_success_rate": recovery_success_rate,
-            "recovery_success_time_s": self._mean(stats["recovery_success_time_s"]),
             "valid_imagined_start_ratio": self._mean(aggregate["valid_imagined_start_ratio"]),
             "soft_termination_height": self._mean(aggregate["soft_termination_height"]),
             "soft_termination_tilt": self._mean(aggregate["soft_termination_tilt"]),
@@ -581,11 +566,15 @@ class SuperMimicRunner:
                     ),
                 }
             )
+        if self.algorithm.recovery_amp is not None:
+            row["recovery_amp_loss"] = self.algorithm.recovery_amp.last_loss
+            row["recovery_amp_reward"] = self._mean(stats["recovery_amp_reward"])
+        row = {name: row[name] for name in self._csv_writer.fieldnames}
         self._csv_writer.writerow(row)
         self._csv_file.flush()
         for name, value in row.items():
             if name not in ("iteration", "wall_h", "sim_steps", "training_stage"):
-                self.writer.add_scalar(f"SuperMimic/{name}", value, iteration)
+                self.writer.add_scalar(_TENSORBOARD_TAGS[name], value, iteration)
         stage_text = (
             f"{row['training_stage']} "
             f"{row['velocity_warmup_completed']}/"
@@ -618,32 +607,56 @@ class SuperMimicRunner:
                 "Pass --motion_checkpoint <model.pt>, or resume an existing mixed run."
             )
         warmup_steps = max(int(self.algorithm_cfg["warmup_steps"]), self.algorithm.world_model_window)
-        stats = {name: [] for name in (
-            "sim_reward", "sim_motion_reward", "sim_teleop_reward",
-            "episode_length", "normalized_return", "termination_count", "done_count",
-            "recovery_ratio", "recovery_success_count", "recovery_failure_count",
-            "recovery_success_time_s", "tracking_error",
-            "sampling_mean_tracking_error",
-        )}
+        stats = {
+            name: []
+            for name in (
+                "sim_reward",
+                "sim_motion_reward",
+                "sim_teleop_reward",
+                "episode_length",
+                "normalized_return",
+                "termination_count",
+                "done_count",
+                "recovery_ratio",
+                "tracking_error",
+                "recovery_amp_reward",
+                "sampling_mean_tracking_error",
+            )
+        }
         print(f"[INFO] Filling SuperMimic replay with {warmup_steps} simulator steps.")
         self._collect(warmup_steps, stats)
         self._open_logging(resume=self.current_learning_iteration > 0)
 
-        aggregate = {name: [] for name in (
-            "world_model_loss", "world_model_error_8", "policy_loss",
-            "self_imitation_loss", "self_imitation_positive_ratio",
-            "gradient_consistency_error", "gradient_consistency_cosine",
-            "gate_cross_entropy_loss", "gate_consistency_loss",
-            "gate_alignment_loss", "gate_recovery_weight",
-            "motion_policy_loss", "teleop_policy_loss", "alignment_loss",
-            "switch_action_continuity_loss",
-            "critic_loss", "motion_critic_loss", "velocity_critic_loss",
-            "imagined_reward", "imagined_motion_reward", "imagined_teleop_reward",
-            "policy_gradient_norm", "imagined_survival",
-            "replay_recovery_ratio", "imagined_recovery_ratio", "valid_imagined_start_ratio",
-            "soft_termination_height", "soft_termination_tilt",
-            "soft_termination_end_effector",
-        )}
+        aggregate = {
+            name: []
+            for name in (
+                "world_model_loss",
+                "world_model_error_8",
+                "policy_loss",
+                "self_imitation_loss",
+                "self_imitation_positive_ratio",
+                "gradient_consistency_error",
+                "gradient_consistency_cosine",
+                "motion_policy_loss",
+                "teleop_policy_loss",
+                "alignment_loss",
+                "switch_action_continuity_loss",
+                "critic_loss",
+                "motion_critic_loss",
+                "velocity_critic_loss",
+                "imagined_reward",
+                "imagined_motion_reward",
+                "imagined_teleop_reward",
+                "policy_gradient_norm",
+                "imagined_survival",
+                "replay_recovery_ratio",
+                "imagined_recovery_ratio",
+                "valid_imagined_start_ratio",
+                "soft_termination_height",
+                "soft_termination_tilt",
+                "soft_termination_end_effector",
+            )
+        }
         start_time = time.time() - self.wall_time_offset
         interval_start = time.time()
         step_accumulator = 0.0
@@ -657,6 +670,11 @@ class SuperMimicRunner:
                 collect_steps = int(step_accumulator)
                 step_accumulator -= collect_steps
                 self._collect(collect_steps, stats)
+                if self.algorithm.recovery_amp is not None:
+                    self.algorithm.recovery_amp.update(
+                        self.algorithm.replay,
+                        self.unwrapped.supermimic_context_layout.recovery_active,
+                    )
                 for _ in range(int(self.algorithm_cfg["world_model_batches"])):
                     loss, error = self.algorithm.world_model_update()
                 aggregate["world_model_loss"].append(float(loss))
