@@ -32,6 +32,17 @@ class SuperMimicAlgorithm:
         self.goal_frames = int(cfg["goal_frames"])
         self.history_length = int(cfg["history_length"])
         self.horizon = int(cfg["imagination_horizon"])
+        requested_chunk_size = max(
+            1, int(cfg.get("imagination_compile_chunk_size", 4))
+        )
+        self.imagination_compile_chunk_size = min(
+            requested_chunk_size, self.horizon
+        )
+        while self.horizon % self.imagination_compile_chunk_size != 0:
+            self.imagination_compile_chunk_size -= 1
+        self.imagination_compile_chunks = (
+            self.horizon // self.imagination_compile_chunk_size
+        )
         self.world_model_window = int(cfg["world_model_window"])
         self.base_learning_rate = float(cfg["learning_rate"])
         self.mixed_tasks = bool(cfg.get("mixed_motion_teleop", False))
@@ -188,7 +199,7 @@ class SuperMimicAlgorithm:
         self.world_model_rollout = self._world_model_rollout
         self.world_model_error = self._world_model_error
         self.imagination_step = self._imagination_step
-        self.imagination_rollout = self._motion_imagination_rollout
+        self.imagination_chunk = self._motion_imagination_chunk
         self.reward_termination = self._reward_termination
         self.critic_input = self._critic_input
         self.teleop_critic_input = self._teleop_critic_input
@@ -215,8 +226,8 @@ class SuperMimicAlgorithm:
             self.imagination_step = torch.compile(
                 self._imagination_step, **reusable_output_compile_options
             )
-            self.imagination_rollout = torch.compile(
-                self._motion_imagination_rollout, **compile_options
+            self.imagination_chunk = torch.compile(
+                self._motion_imagination_chunk, **reusable_output_compile_options
             )
             self.reward_termination = torch.compile(self._reward_termination, **compile_options)
             self.critic_input = torch.compile(
@@ -240,7 +251,9 @@ class SuperMimicAlgorithm:
             "[INFO] SuperMimic GPU execution: "
             f"compile={self.compile_enabled} mode={self.compile_mode} "
             f"fused_adam={self.fused_optimizer} async_prefetch="
-            f"{self._world_model_prefetch_stream is not None}"
+            f"{self._world_model_prefetch_stream is not None} "
+            f"imagination_chunk={self.imagination_compile_chunk_size}x"
+            f"{self.imagination_compile_chunks}"
         )
         self.motion_initialized = not self.mixed_tasks
         self.velocity_warmup_completed = 0
@@ -811,7 +824,7 @@ class SuperMimicAlgorithm:
         next_goal = self.mdp.goal(next_frame, self.goal_frames)
         return next_state, action, next_history, next_frame, next_goal
 
-    def _motion_imagination_rollout(
+    def _motion_imagination_chunk(
         self,
         state,
         observation_history,
@@ -822,14 +835,14 @@ class SuperMimicAlgorithm:
         previous_action,
         episode_step,
     ):
-        """Run the fixed motion-only horizon as one compilable GPU program."""
+        """Run one fixed motion-only chunk while preserving BPTT carry state."""
         state_sequence = [[] for _ in range(6)]
         actions = []
         previous_actions = []
         frames = []
         goals = []
         contexts = [context]
-        for _ in range(self.horizon):
+        for _ in range(self.imagination_compile_chunk_size):
             previous_actions.append(previous_action)
             state, previous_action, observation_history, frame, goal = self._imagination_step(
                 state,
@@ -860,6 +873,9 @@ class SuperMimicAlgorithm:
             torch.stack(frames),
             torch.stack(goals),
             torch.stack(contexts),
+            observation_history,
+            normalized_context,
+            episode_step,
         )
 
     def _mixed_imagination_step(
@@ -1253,23 +1269,56 @@ class SuperMimicAlgorithm:
                 normalized_context = self._normalize_context(context)
                 contexts.append(context)
         else:
-            (
-                state_sequence,
-                action_sequence,
-                previous_action_sequence,
-                frame_sequence,
-                goal_sequence,
-                context_sequence,
-            ) = self.imagination_rollout(
-                state,
-                observation_history,
-                frame,
-                context,
-                normalized_context,
-                goal,
-                previous_action,
-                episode_step,
+            state_chunks = [[] for _ in range(6)]
+            action_chunks = []
+            previous_action_chunks = []
+            frame_chunks = []
+            goal_chunks = []
+            context_chunks = []
+            for chunk_index in range(self.imagination_compile_chunks):
+                (
+                    chunk_states,
+                    chunk_actions,
+                    chunk_previous_actions,
+                    chunk_frames,
+                    chunk_goals,
+                    chunk_contexts,
+                    observation_history,
+                    normalized_context,
+                    episode_step,
+                ) = self.imagination_chunk(
+                    state,
+                    observation_history,
+                    frame,
+                    context,
+                    normalized_context,
+                    goal,
+                    previous_action,
+                    episode_step,
+                )
+                for index, values in enumerate(chunk_states):
+                    state_chunks[index].append(values)
+                action_chunks.append(chunk_actions)
+                previous_action_chunks.append(chunk_previous_actions)
+                frame_chunks.append(chunk_frames)
+                goal_chunks.append(chunk_goals)
+                context_chunks.append(
+                    chunk_contexts if chunk_index == 0 else chunk_contexts[1:]
+                )
+                state = tuple(values[-1] for values in chunk_states)
+                previous_action = chunk_actions[-1]
+                frame = chunk_frames[-1]
+                goal = chunk_goals[-1]
+                context = chunk_contexts[-1]
+
+            state_sequence = tuple(
+                torch.cat(chunks, dim=0) for chunks in state_chunks
             )
+            action_sequence = torch.cat(action_chunks, dim=0)
+            previous_action_sequence = torch.cat(previous_action_chunks, dim=0)
+            frame_sequence = torch.cat(frame_chunks, dim=0)
+            goal_sequence = torch.cat(goal_chunks, dim=0)
+            context_sequence = torch.cat(context_chunks, dim=0)
             states = [
                 tuple(value[step] for value in state_sequence)
                 for step in range(self.horizon)
@@ -1284,7 +1333,6 @@ class SuperMimicAlgorithm:
             frame = frame_sequence[-1]
             goal = goal_sequence[-1]
             context = context_sequence[-1]
-            normalized_context = self._normalize_context(context)
 
         flatten = lambda values: torch.stack(values).flatten(0, 1)  # noqa: E731
         if self.mixed_tasks:
@@ -1315,8 +1363,8 @@ class SuperMimicAlgorithm:
                 context_sequence[1:].flatten(0, 1),
             )
         if self.recovery_amp is not None:
+            prior_states = [initial_state] + states[:-1]
             if self.mixed_tasks:
-                prior_states = [initial_state] + states[:-1]
                 prior_flat = tuple(flatten([s[i] for s in prior_states]) for i in range(6))
             else:
                 prior_flat = tuple(
