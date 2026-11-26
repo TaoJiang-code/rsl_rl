@@ -15,8 +15,14 @@ from rsl_rl.algorithms.supermimic.mdp import (
     flatten_state,
     unflatten_state,
 )
-from rsl_rl.algorithms.supermimic.networks import Policy, WorldModel
-from rsl_rl.algorithms.supermimic.rotations import quat_to_mat, so3_exp, so3_log
+from rsl_rl.algorithms.supermimic.networks import Policy, RunningNorm, WorldModel
+from rsl_rl.algorithms.supermimic.rotations import (
+    mat33_mul,
+    mat33_vec,
+    quat_to_mat,
+    so3_exp,
+    so3_log,
+)
 
 
 JOINT_NAMES = [
@@ -60,6 +66,46 @@ def test_state_and_rotation_round_trip():
     rebuilt = unflatten_state(flatten_state(state))
     for actual, expected in zip(rebuilt, state):
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_fused_small_matrix_ops_match_torch_matmul_and_gradients():
+    matrix_a = torch.randn(4, 1, 3, 3, requires_grad=True)
+    matrix_b = torch.randn(1, 5, 3, 3, requires_grad=True)
+    vector = torch.randn(4, 5, 3, requires_grad=True)
+
+    product = mat33_mul(matrix_a, matrix_b)
+    transformed = mat33_vec(product, vector)
+    expected_product = matrix_a @ matrix_b
+    expected_transformed = (expected_product @ vector.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(product, expected_product)
+    torch.testing.assert_close(transformed, expected_transformed)
+
+    actual_gradients = torch.autograd.grad(transformed.square().sum(), (matrix_a, matrix_b, vector))
+    expected_gradients = torch.autograd.grad(
+        expected_transformed.square().sum(), (matrix_a, matrix_b, vector)
+    )
+    for actual, expected in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_running_norm_masked_update_ignores_inactive_rows_without_sync_branch():
+    normalizer = RunningNorm(3)
+    values = torch.randn(8, 3)
+    mask = torch.tensor([True, False, True, False, True, False, False, True])
+    selected = values[mask]
+
+    normalizer.update(values, mask)
+    torch.testing.assert_close(normalizer.mean, selected.mean(0))
+    torch.testing.assert_close(normalizer.var, selected.var(0, unbiased=False))
+    mean, variance, count = (
+        normalizer.mean.clone(),
+        normalizer.var.clone(),
+        normalizer.count.clone(),
+    )
+    normalizer.update(values, torch.zeros_like(mask))
+    torch.testing.assert_close(normalizer.mean, mean)
+    torch.testing.assert_close(normalizer.var, variance)
+    torch.testing.assert_close(normalizer.count, count)
 
 
 def test_replay_window_masks_episode_boundaries():

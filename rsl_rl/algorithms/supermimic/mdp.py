@@ -6,7 +6,15 @@ from dataclasses import dataclass
 
 import torch
 
-from .rotations import mat_to_6d, mat_to_quat, quat_to_mat, rot_angle_sq, yaw_mat
+from .rotations import (
+    mat33_mul,
+    mat33_vec,
+    mat_to_6d,
+    mat_to_quat,
+    quat_to_mat,
+    rot_angle_sq,
+    yaw_mat,
+)
 
 CONTROL_DT = 0.02
 
@@ -131,9 +139,9 @@ def invariant_features(state) -> torch.Tensor:
     return torch.cat(
         (
             p[..., 2:3],
-            mat_to_6d(heading.transpose(-1, -2) @ rotation),
-            (rotation_t @ v.unsqueeze(-1)).squeeze(-1),
-            (rotation_t @ w.unsqueeze(-1)).squeeze(-1),
+            mat_to_6d(mat33_mul(heading.transpose(-1, -2), rotation)),
+            mat33_vec(rotation_t, v),
+            mat33_vec(rotation_t, w),
             q,
             qd,
         ),
@@ -277,7 +285,7 @@ class SuperMimicMDP:
         root_rotation = quat_to_mat(self.motion.body_quat_w[frame, 0])
         heading_t = yaw_mat(root_rotation).transpose(-1, -2)
         root_velocity = self.motion.body_lin_vel_w[frame, 0]
-        local_velocity = (heading_t @ root_velocity.unsqueeze(-1)).squeeze(-1)
+        local_velocity = mat33_vec(heading_t, root_velocity)
         yaw_rate = self.motion.body_ang_vel_w[frame, 0, 2:3]
         return torch.cat((local_velocity[..., :2], yaw_rate), dim=-1)
 
@@ -302,13 +310,13 @@ class SuperMimicMDP:
             self.motion.gather_command_motion("body_quat_w", frame)[..., 0, :]
         )
         if reference_yaw_rotation is not None:
-            reference_rotation = reference_yaw_rotation @ reference_rotation
-        relative_reference = mat_to_6d(rotation_t @ reference_rotation)
+            reference_rotation = mat33_mul(reference_yaw_rotation, reference_rotation)
+        relative_reference = mat_to_6d(mat33_mul(rotation_t, reference_rotation))
         return torch.cat(
             (
                 q - self.default_joint_position - calibration,
                 qd,
-                (rotation_t @ w.unsqueeze(-1)).squeeze(-1),
+                mat33_vec(rotation_t, w),
                 projected_gravity,
                 previous_action,
                 relative_reference,
@@ -324,8 +332,8 @@ class SuperMimicMDP:
         p, rotation, _, _, _, _ = state
         reference_p = self.motion.body_pos_w[frame, 0]
         reference_r = quat_to_mat(self.motion.body_quat_w[frame, 0])
-        yaw_rotation = yaw_mat(rotation @ reference_r.transpose(-1, -2))
-        rotated_reference_p = (yaw_rotation @ reference_p.unsqueeze(-1)).squeeze(-1)
+        yaw_rotation = yaw_mat(mat33_mul(rotation, reference_r.transpose(-1, -2)))
+        rotated_reference_p = mat33_vec(yaw_rotation, reference_p)
         translation = torch.cat(
             (
                 p[..., :2] - rotated_reference_p[..., :2],
@@ -357,33 +365,23 @@ class SuperMimicMDP:
         reference_body_v = self.motion.body_lin_vel_w[frame]
         reference_body_w = self.motion.body_ang_vel_w[frame]
         if reference_yaw_rotation is not None:
-            reference_p = (
-                reference_yaw_rotation @ reference_p.unsqueeze(-1)
-            ).squeeze(-1)
-            reference_r = reference_yaw_rotation @ reference_r
-            reference_body_p_raw = (
-                reference_yaw_rotation.unsqueeze(-3)
-                @ reference_body_p_raw.unsqueeze(-1)
-            ).squeeze(-1)
-            reference_body_r_raw = reference_yaw_rotation.unsqueeze(-3) @ reference_body_r_raw
-            reference_body_v = (
-                reference_yaw_rotation.unsqueeze(-3)
-                @ reference_body_v.unsqueeze(-1)
-            ).squeeze(-1)
-            reference_body_w = (
-                reference_yaw_rotation.unsqueeze(-3)
-                @ reference_body_w.unsqueeze(-1)
-            ).squeeze(-1)
+            yaw = reference_yaw_rotation.unsqueeze(-3)
+            reference_p = mat33_vec(reference_yaw_rotation, reference_p)
+            reference_r = mat33_mul(reference_yaw_rotation, reference_r)
+            reference_body_p_raw = mat33_vec(yaw, reference_body_p_raw)
+            reference_body_r_raw = mat33_mul(yaw, reference_body_r_raw)
+            reference_body_v = mat33_vec(yaw, reference_body_v)
+            reference_body_w = mat33_vec(yaw, reference_body_w)
         if reference_translation is not None:
             reference_p = reference_p + reference_translation
             reference_body_p_raw = reference_body_p_raw + reference_translation.unsqueeze(-2)
-        yaw_delta = yaw_mat(rotation @ reference_r.transpose(-1, -2))
+        yaw_delta = yaw_mat(mat33_mul(rotation, reference_r.transpose(-1, -2)))
         anchor = torch.cat((p[..., :2], reference_p[..., 2:3]), -1)
-        reference_body_p = anchor.unsqueeze(-2) + (
-            yaw_delta.unsqueeze(-3)
-            @ (reference_body_p_raw - reference_p.unsqueeze(-2)).unsqueeze(-1)
-        ).squeeze(-1)
-        reference_body_r = yaw_delta.unsqueeze(-3) @ reference_body_r_raw
+        yaw_delta_bodies = yaw_delta.unsqueeze(-3)
+        reference_body_p = anchor.unsqueeze(-2) + mat33_vec(
+            yaw_delta_bodies, reference_body_p_raw - reference_p.unsqueeze(-2)
+        )
+        reference_body_r = mat33_mul(yaw_delta_bodies, reference_body_r_raw)
         body_position_error = (reference_body_p - body_p).square().sum(-1).mean(-1)
         body_orientation_error = rot_angle_sq(reference_body_r, body_r).mean(-1)
         body_linear_velocity_error = (reference_body_v - body_v).square().sum(-1).mean(-1)
@@ -491,13 +489,15 @@ class SuperMimicMDP:
         body_p, body_r, _, _ = self.kinematics.forward(p, rotation, v, w, q, qd)
         reference_p = self.motion.body_pos_w[frame, 0]
         reference_r = quat_to_mat(self.motion.body_quat_w[frame, 0])
-        yaw_delta = yaw_mat(rotation @ reference_r.transpose(-1, -2))
+        yaw_delta = yaw_mat(mat33_mul(rotation, reference_r.transpose(-1, -2)))
         anchor = torch.cat((p[..., :2], reference_p[..., 2:3]), -1)
-        reference_body_p = anchor.unsqueeze(-2) + (
-            yaw_delta.unsqueeze(-3)
-            @ (self.motion.body_pos_w[frame] - reference_p.unsqueeze(-2)).unsqueeze(-1)
-        ).squeeze(-1)
-        reference_body_r = yaw_delta.unsqueeze(-3) @ quat_to_mat(self.motion.body_quat_w[frame])
+        yaw_delta_bodies = yaw_delta.unsqueeze(-3)
+        reference_body_p = anchor.unsqueeze(-2) + mat33_vec(
+            yaw_delta_bodies, self.motion.body_pos_w[frame] - reference_p.unsqueeze(-2)
+        )
+        reference_body_r = mat33_mul(
+            yaw_delta_bodies, quat_to_mat(self.motion.body_quat_w[frame])
+        )
 
         if not self.teleop_body_ids:
             raise RuntimeError("Teleop reward requires at least one tracked upper-body link.")
@@ -509,7 +509,7 @@ class SuperMimicMDP:
             reference_body_r[..., ids, :, :], body_r[..., ids, :, :]
         ).mean(-1)
         heading_t = yaw_mat(rotation).transpose(-1, -2)
-        local_velocity = (heading_t @ v.unsqueeze(-1)).squeeze(-1)
+        local_velocity = mat33_vec(heading_t, v)
         linear_velocity_error = (velocity_command[..., :2] - local_velocity[..., :2]).square().sum(-1)
         angular_velocity_error = (velocity_command[..., 2] - w[..., 2]).square()
         root_height_error = (reference_p[..., 2] - p[..., 2]).square()
@@ -638,17 +638,19 @@ class SuperMimicMDP:
         reference_p = self.motion.body_pos_w[frame, 0]
         reference_r = quat_to_mat(self.motion.body_quat_w[frame, 0])
         body_p = self.kinematics.forward(p, rotation, v, w, q, qd)[0]
-        yaw_delta = yaw_mat(rotation @ reference_r.transpose(-1, -2))
+        yaw_delta = yaw_mat(mat33_mul(rotation, reference_r.transpose(-1, -2)))
         anchor = torch.cat((p[..., :2], reference_p[..., 2:3]), -1)
-        reference_body_p = anchor.unsqueeze(-2) + (
-            yaw_delta.unsqueeze(-3)
-            @ (self.motion.body_pos_w[frame] - reference_p.unsqueeze(-2)).unsqueeze(-1)
-        ).squeeze(-1)
-        body_error = (
-            heading_t.unsqueeze(-3) @ (reference_body_p - body_p).unsqueeze(-1)
-        ).squeeze(-1).flatten(-2)
-        root_error = (heading_t @ (reference_p - p).unsqueeze(-1)).squeeze(-1)
-        relative_rotation = mat_to_6d(rotation.transpose(-1, -2) @ reference_r)
+        reference_body_p = anchor.unsqueeze(-2) + mat33_vec(
+            yaw_delta.unsqueeze(-3),
+            self.motion.body_pos_w[frame] - reference_p.unsqueeze(-2),
+        )
+        body_error = mat33_vec(
+            heading_t.unsqueeze(-3), reference_body_p - body_p
+        ).flatten(-2)
+        root_error = mat33_vec(heading_t, reference_p - p)
+        relative_rotation = mat_to_6d(
+            mat33_mul(rotation.transpose(-1, -2), reference_r)
+        )
         return torch.cat(
             (
                 invariant_features(state),

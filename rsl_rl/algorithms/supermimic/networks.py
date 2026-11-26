@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from .mdp import SuperMimicRobotSpec, invariant_features
-from .rotations import so3_exp, so3_log, yaw_mat
+from .rotations import mat33_mul, mat33_vec, so3_exp, so3_log, yaw_mat
 
 AMP_DTYPE: torch.dtype | None = None
 
@@ -41,19 +41,31 @@ class RunningNorm(nn.Module):
         self.max_count, self.eps = max_count, eps
 
     @torch.no_grad()
-    def update(self, value: torch.Tensor) -> None:
+    def update(self, value: torch.Tensor, mask: torch.Tensor | None = None) -> None:
         value = value.reshape(-1, value.shape[-1]).float()
-        if self.count >= self.max_count:
-            return
-        count = value.shape[0]
-        mean, variance = value.mean(0), value.var(0, unbiased=False)
-        total = self.count + count
+        if mask is None:
+            count = self.count.new_tensor(value.shape[0])
+            mean, variance = value.mean(0), value.var(0, unbiased=False)
+        else:
+            weights = mask.reshape(-1).to(value.dtype)
+            count = weights.sum()
+            denominator = count.clamp_min(1.0)
+            mean = (value * weights[:, None]).sum(0) / denominator
+            variance = ((value - mean).square() * weights[:, None]).sum(0) / denominator
+        accepted = torch.minimum(count, (self.max_count - self.count).clamp_min(0.0))
+        total = self.count + accepted
+        safe_total = total.clamp_min(1.0)
         delta = mean - self.mean
-        self.mean += delta * count / total
-        self.var = (
-            self.var * self.count + variance * count + delta.square() * self.count * count / total
-        ) / total
-        self.count = total
+        next_mean = self.mean + delta * accepted / safe_total
+        next_var = (
+            self.var * self.count
+            + variance * accepted
+            + delta.square() * self.count * accepted / safe_total
+        ) / safe_total
+        update = (accepted > 0.0).to(self.mean.dtype)
+        self.mean.copy_(torch.lerp(self.mean, next_mean, update))
+        self.var.copy_(torch.lerp(self.var, next_var, update))
+        self.count.copy_(total)
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return (value - self.mean) / torch.sqrt(self.var + self.eps**2)
@@ -110,10 +122,10 @@ class WorldModel(nn.Module):
         rotation_t = rotation.transpose(-1, -2)
         return torch.cat(
             (
-                (heading.transpose(-1, -2) @ (p1 - p).unsqueeze(-1)).squeeze(-1),
-                so3_log(rotation_t @ rotation1),
-                (rotation_t @ (v1 - v).unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ (w1 - w).unsqueeze(-1)).squeeze(-1),
+                mat33_vec(heading.transpose(-1, -2), p1 - p),
+                so3_log(mat33_mul(rotation_t, rotation1)),
+                mat33_vec(rotation_t, v1 - v),
+                mat33_vec(rotation_t, w1 - w),
                 q1 - q,
                 qd1 - qd,
             ),
@@ -125,14 +137,12 @@ class WorldModel(nn.Module):
         heading = yaw_mat(rotation)
         old_weight = self.control_dt * (1.0 - self.DRIFT_WEIGHT)
         new_weight = self.control_dt * self.DRIFT_WEIGHT
-        position_drift = (
-            heading.transpose(-1, -2)
-            @ (old_weight * v + new_weight * next_v).unsqueeze(-1)
-        ).squeeze(-1)
-        orientation_drift = (
-            rotation.transpose(-1, -2)
-            @ (old_weight * w + new_weight * next_w).unsqueeze(-1)
-        ).squeeze(-1)
+        position_drift = mat33_vec(
+            heading.transpose(-1, -2), old_weight * v + new_weight * next_v
+        )
+        orientation_drift = mat33_vec(
+            rotation.transpose(-1, -2), old_weight * w + new_weight * next_w
+        )
         joint_drift = old_weight * qd + new_weight * next_qd
         return position_drift, orientation_drift, joint_drift
 
@@ -165,8 +175,8 @@ class WorldModel(nn.Module):
             (3, 3, 3, 3, self.num_joints, self.num_joints), -1
         )
         heading = yaw_mat(rotation)
-        next_v = v + (rotation @ dv.unsqueeze(-1)).squeeze(-1)
-        next_w = w + (rotation @ dw.unsqueeze(-1)).squeeze(-1)
+        next_v = v + mat33_vec(rotation, dv)
+        next_w = w + mat33_vec(rotation, dw)
         next_qd = qd + dqd
         if self.structured:
             drift_p, drift_theta, drift_q = self._drift(state, next_v, next_w, next_qd)
@@ -174,8 +184,8 @@ class WorldModel(nn.Module):
             dtheta = dtheta + drift_theta
             dq = dq + drift_q
         return (
-            p + (heading @ dp.unsqueeze(-1)).squeeze(-1),
-            rotation @ so3_exp(dtheta),
+            p + mat33_vec(heading, dp),
+            mat33_mul(rotation, so3_exp(dtheta)),
             next_v,
             next_w,
             q + dq,
@@ -190,10 +200,10 @@ class WorldModel(nn.Module):
         rotation_t = rotation.transpose(-1, -2)
         return torch.cat(
             (
-                (heading.transpose(-1, -2) @ (ph - p).unsqueeze(-1)).squeeze(-1),
-                so3_log(rotation_t @ rh),
-                (rotation_t @ (vh - v).unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ (wh - w).unsqueeze(-1)).squeeze(-1),
+                mat33_vec(heading.transpose(-1, -2), ph - p),
+                so3_log(mat33_mul(rotation_t, rh)),
+                mat33_vec(rotation_t, vh - v),
+                mat33_vec(rotation_t, wh - w),
                 qh - q,
                 qdh - qd,
             ),

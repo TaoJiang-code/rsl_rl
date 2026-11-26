@@ -19,6 +19,7 @@ from .mdp import (
 )
 from .networks import Critic, Policy, RunningNorm, WorldModel
 from . import networks
+from .rotations import mat33_mul
 
 
 class SuperMimicAlgorithm:
@@ -47,6 +48,13 @@ class SuperMimicAlgorithm:
             cfg.get("value_gradient_consistency_epochs", 1)
         )
         self.policy_ema_decay = float(cfg.get("policy_ema_decay", 0.0))
+        self.compile_enabled = bool(cfg.get("compile", True))
+        self.compile_mode = str(cfg.get("compile_mode", "reduce-overhead"))
+        self.compile_fullgraph = bool(cfg.get("compile_fullgraph", False))
+        self.async_replay_prefetch = bool(cfg.get("async_replay_prefetch", True))
+        self.fused_optimizer = bool(cfg.get("fused_optimizer", True)) and str(device).startswith("cuda")
+        if str(device).startswith("cuda") and bool(cfg.get("allow_tf32", True)):
+            torch.set_float32_matmul_precision("high")
         goal_dim = self.robot_spec.goal_dim(self.goal_frames)
         teleop_goal_dim = (
             self.robot_spec.teleop_goal_dim(self.goal_frames) if self.mixed_tasks else None
@@ -93,28 +101,35 @@ class SuperMimicAlgorithm:
             if self.mdp.context_layout is not None
             else None
         )
-        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=self.base_learning_rate)
+        optimizer_kwargs = {"lr": self.base_learning_rate}
+        if self.fused_optimizer:
+            optimizer_kwargs["fused"] = True
+        self.world_model_optimizer = torch.optim.Adam(
+            self.world_model.parameters(), **optimizer_kwargs
+        )
         if self.mixed_tasks:
             self.policy_optimizer = torch.optim.Adam(
                 chain(self.policy.encoder.parameters(), self.policy.decoder.parameters()),
-                lr=self.base_learning_rate,
                 betas=(0.9, 0.95),
+                **optimizer_kwargs,
             )
             self.teleop_optimizer = torch.optim.Adam(
                 self.policy.teleop_encoder.parameters(),
-                lr=self.base_learning_rate,
                 betas=(0.9, 0.95),
+                **optimizer_kwargs,
             )
         else:
             self.policy_optimizer = torch.optim.Adam(
-                self.policy.parameters(), lr=self.base_learning_rate, betas=(0.9, 0.95)
+                self.policy.parameters(), betas=(0.9, 0.95), **optimizer_kwargs
             )
             self.teleop_optimizer = None
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.base_learning_rate)
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(), **optimizer_kwargs
+        )
         self.velocity_critic_optimizer = (
             None
             if self.velocity_critic is None
-            else torch.optim.Adam(self.velocity_critic.parameters(), lr=self.base_learning_rate)
+            else torch.optim.Adam(self.velocity_critic.parameters(), **optimizer_kwargs)
         )
         self.replay = ReplayBuffer(
             int(cfg["replay_steps"]),
@@ -123,6 +138,10 @@ class SuperMimicAlgorithm:
             self.robot_spec,
             mixed_tasks=self.mixed_tasks,
         )
+        self._world_model_prefetch_stream = None
+        self._world_model_prefetched = None
+        if self.async_replay_prefetch and str(device).startswith("cuda"):
+            self._world_model_prefetch_stream = torch.cuda.Stream(device=torch.device(device))
         action_scale = torch.as_tensor(
             cfg.get("action_scale", [1.0] * self.robot_spec.num_joints),
             device=device,
@@ -169,10 +188,11 @@ class SuperMimicAlgorithm:
         self.world_model_rollout = self._world_model_rollout
         self.world_model_error = self._world_model_error
         self.imagination_step = self._imagination_step
+        self.imagination_rollout = self._motion_imagination_rollout
         self.reward_termination = self._reward_termination
         self.critic_input = self._critic_input
         self.teleop_critic_input = self._teleop_critic_input
-        if cfg.get("compile", True):
+        if self.compile_enabled:
             compile_threads = int(cfg.get("compile_threads", 0))
             if compile_threads > 0:
                 os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(compile_threads)
@@ -180,19 +200,48 @@ class SuperMimicAlgorithm:
 
                 inductor_config.compile_threads = compile_threads
                 print(f"[INFO] TorchInductor compile threads: {compile_threads}")
-            self.world_model_rollout = torch.compile(self._world_model_rollout)
-            self.world_model_error = torch.compile(self._world_model_error)
-            self.imagination_step = torch.compile(self._imagination_step)
-            self.reward_termination = torch.compile(self._reward_termination)
-            self.critic_input = torch.compile(self._critic_input)
+            compile_options = {
+                "mode": self.compile_mode,
+                "fullgraph": self.compile_fullgraph,
+                "dynamic": False,
+            }
+            reusable_output_compile_options = {
+                "mode": "default",
+                "fullgraph": self.compile_fullgraph,
+                "dynamic": False,
+            }
+            self.world_model_rollout = torch.compile(self._world_model_rollout, **compile_options)
+            self.world_model_error = torch.compile(self._world_model_error, **compile_options)
+            self.imagination_step = torch.compile(
+                self._imagination_step, **reusable_output_compile_options
+            )
+            self.imagination_rollout = torch.compile(
+                self._motion_imagination_rollout, **compile_options
+            )
+            self.reward_termination = torch.compile(self._reward_termination, **compile_options)
+            self.critic_input = torch.compile(
+                self._critic_input, **reusable_output_compile_options
+            )
             if self.mixed_tasks:
-                self.teleop_critic_input = torch.compile(self._teleop_critic_input)
+                self.teleop_critic_input = torch.compile(
+                    self._teleop_critic_input, **reusable_output_compile_options
+                )
         if self.mixed_tasks:
             self.imagination_step = self._mixed_imagination_step
             self.reward_termination = self._mixed_reward_termination
-            if cfg.get("compile", True):
-                self.imagination_step = torch.compile(self._mixed_imagination_step)
-                self.reward_termination = torch.compile(self._mixed_reward_termination)
+            if self.compile_enabled:
+                self.imagination_step = torch.compile(
+                    self._mixed_imagination_step, **reusable_output_compile_options
+                )
+                self.reward_termination = torch.compile(
+                    self._mixed_reward_termination, **compile_options
+                )
+        print(
+            "[INFO] SuperMimic GPU execution: "
+            f"compile={self.compile_enabled} mode={self.compile_mode} "
+            f"fused_adam={self.fused_optimizer} async_prefetch="
+            f"{self._world_model_prefetch_stream is not None}"
+        )
         self.motion_initialized = not self.mixed_tasks
         self.velocity_warmup_completed = 0
 
@@ -243,10 +292,9 @@ class SuperMimicAlgorithm:
             if teleop_goal is None or teleop_task is None or self.policy.teleop_goal_norm is None:
                 raise ValueError("Mixed SuperMimic normalizers require teleop goal and task mask.")
             motion = ~teleop_task.bool()
-            if motion.any() and not self.in_velocity_warmup:
-                self.policy.goal_norm.update(goal[motion])
-            if teleop_task.any():
-                self.policy.teleop_goal_norm.update(teleop_goal[teleop_task.bool()])
+            if not self.in_velocity_warmup:
+                self.policy.goal_norm.update(goal, motion)
+            self.policy.teleop_goal_norm.update(teleop_goal, teleop_task)
         else:
             self.policy.goal_norm.update(goal)
         state = unflatten_state(transition["s"])
@@ -290,10 +338,41 @@ class SuperMimicAlgorithm:
         error = (self.world_model.state_error(predicted, target) / std).square().mean(-1)
         return (error * mask).sum() / next_state.shape[0], error[:, -1]
 
-    def world_model_update(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _schedule_world_model_prefetch(self) -> None:
+        if self._world_model_prefetch_stream is None:
+            return
         batch_size = int(self.cfg["world_model_batch_size"])
+        with torch.cuda.stream(self._world_model_prefetch_stream):
+            self._world_model_prefetched = self.replay.sample_windows(
+                batch_size, self.world_model_window
+            )
+
+    def _next_world_model_sample(self) -> dict[str, torch.Tensor]:
+        if self._world_model_prefetch_stream is None:
+            return self.replay.sample_windows(
+                int(self.cfg["world_model_batch_size"]), self.world_model_window
+            )
+        if self._world_model_prefetched is None:
+            self._schedule_world_model_prefetch()
+        current_stream = torch.cuda.current_stream(device=torch.device(self.device))
+        current_stream.wait_stream(self._world_model_prefetch_stream)
+        sample = self._world_model_prefetched
+        for value in sample.values():
+            value.record_stream(current_stream)
+        self._world_model_prefetched = None
+        self._schedule_world_model_prefetch()
+        return sample
+
+    def seal_replay_prefetch(self) -> None:
+        """Order later replay writes after the side-stream gather without a host sync."""
+        if self._world_model_prefetch_stream is not None:
+            torch.cuda.current_stream(device=torch.device(self.device)).wait_stream(
+                self._world_model_prefetch_stream
+            )
+
+    def world_model_update(self) -> tuple[torch.Tensor, torch.Tensor]:
         window = self.world_model_window
-        sample = self.replay.sample_windows(batch_size, window)
+        sample = self._next_world_model_sample()
         predicted = self.world_model_rollout(
             sample["s"], sample["a"], sample["a_prev"], sample["xi"]
         )
@@ -395,7 +474,7 @@ class SuperMimicAlgorithm:
     def _gradient_coordinates(self, gradients, rotation, scale):
         parts = (
             gradients[0],
-            self._rotation_vee(rotation.transpose(-1, -2) @ gradients[1]),
+            self._rotation_vee(mat33_mul(rotation.transpose(-1, -2), gradients[1])),
             *gradients[2:],
         )
         return torch.cat([part.flatten(1) for part in parts], -1) * scale
@@ -404,7 +483,10 @@ class SuperMimicAlgorithm:
         p, rotation, v, w, q, qd = state_sequence
         differences = (
             p[1:] - p[:-1],
-            0.5 * self._rotation_vee(rotation[:-1].transpose(-1, -2) @ rotation[1:]),
+            0.5
+            * self._rotation_vee(
+                mat33_mul(rotation[:-1].transpose(-1, -2), rotation[1:])
+            ),
             v[1:] - v[:-1],
             w[1:] - w[:-1],
             q[1:] - q[:-1],
@@ -728,6 +810,57 @@ class SuperMimicAlgorithm:
         next_history = torch.cat((observation_history[:, 1:], observation[:, None]), 1)
         next_goal = self.mdp.goal(next_frame, self.goal_frames)
         return next_state, action, next_history, next_frame, next_goal
+
+    def _motion_imagination_rollout(
+        self,
+        state,
+        observation_history,
+        frame,
+        context,
+        normalized_context,
+        goal,
+        previous_action,
+        episode_step,
+    ):
+        """Run the fixed motion-only horizon as one compilable GPU program."""
+        state_sequence = [[] for _ in range(6)]
+        actions = []
+        previous_actions = []
+        frames = []
+        goals = []
+        contexts = [context]
+        for _ in range(self.horizon):
+            previous_actions.append(previous_action)
+            state, previous_action, observation_history, frame, goal = self._imagination_step(
+                state,
+                observation_history,
+                frame,
+                context,
+                normalized_context,
+                goal,
+                previous_action,
+            )
+            for index, value in enumerate(state):
+                state_sequence[index].append(value)
+            actions.append(previous_action)
+            frames.append(frame)
+            goals.append(goal)
+            episode_step = episode_step + 1
+            context = self.mdp.advance_context(
+                context,
+                episode_step,
+                int(self.cfg["recovery_window_steps"]),
+            )
+            normalized_context = self._normalize_context(context)
+            contexts.append(context)
+        return (
+            tuple(torch.stack(values) for values in state_sequence),
+            torch.stack(actions),
+            torch.stack(previous_actions),
+            torch.stack(frames),
+            torch.stack(goals),
+            torch.stack(contexts),
+        )
 
     def _mixed_imagination_step(
         self,
@@ -1070,10 +1203,10 @@ class SuperMimicAlgorithm:
         next_task_modes = []
         reference_yaw_rotations = []
         reference_translations = []
-        contexts = [context]
-        for _ in range(self.horizon):
-            previous_actions.append(previous_action)
-            if self.mixed_tasks:
+        if self.mixed_tasks:
+            contexts = [context]
+            for _ in range(self.horizon):
+                previous_actions.append(previous_action)
                 velocity_commands.append(velocity_command)
                 task_modes.append(teleop_task)
                 reference_yaw_rotations.append(reference_yaw_rotation)
@@ -1107,32 +1240,59 @@ class SuperMimicAlgorithm:
                 )
                 teleop_goals.append(teleop_goal)
                 next_task_modes.append(teleop_task)
-            else:
-                state, previous_action, observation_history, frame, goal = self.imagination_step(
-                    state,
-                    observation_history,
-                    frame,
+                states.append(state)
+                actions.append(previous_action)
+                frames.append(frame)
+                goals.append(goal)
+                episode_step = episode_step + 1
+                context = self.mdp.advance_context(
                     context,
-                    normalized_context,
-                    goal,
-                    previous_action,
+                    episode_step,
+                    int(self.cfg["recovery_window_steps"]),
                 )
-            states.append(state)
-            actions.append(previous_action)
-            frames.append(frame)
-            goals.append(goal)
-            episode_step = episode_step + 1
-            context = self.mdp.advance_context(
+                normalized_context = self._normalize_context(context)
+                contexts.append(context)
+        else:
+            (
+                state_sequence,
+                action_sequence,
+                previous_action_sequence,
+                frame_sequence,
+                goal_sequence,
+                context_sequence,
+            ) = self.imagination_rollout(
+                state,
+                observation_history,
+                frame,
                 context,
+                normalized_context,
+                goal,
+                previous_action,
                 episode_step,
-                int(self.cfg["recovery_window_steps"]),
             )
+            states = [
+                tuple(value[step] for value in state_sequence)
+                for step in range(self.horizon)
+            ]
+            actions = list(action_sequence.unbind(0))
+            previous_actions = list(previous_action_sequence.unbind(0))
+            frames = list(frame_sequence.unbind(0))
+            goals = list(goal_sequence.unbind(0))
+            contexts = list(context_sequence.unbind(0))
+            state = tuple(value[-1] for value in state_sequence)
+            previous_action = action_sequence[-1]
+            frame = frame_sequence[-1]
+            goal = goal_sequence[-1]
+            context = context_sequence[-1]
             normalized_context = self._normalize_context(context)
-            contexts.append(context)
 
         flatten = lambda values: torch.stack(values).flatten(0, 1)  # noqa: E731
-        all_states = tuple(flatten([state_at_time[index] for state_at_time in states]) for index in range(6))
         if self.mixed_tasks:
+            rollout_contexts = torch.stack(contexts)
+            all_states = tuple(
+                flatten([state_at_time[index] for state_at_time in states])
+                for index in range(6)
+            )
             rewards, terminations, termination_terms = self.reward_termination(
                 all_states,
                 flatten(frames),
@@ -1145,17 +1305,27 @@ class SuperMimicAlgorithm:
                 flatten(reference_translations),
             )
         else:
+            rollout_contexts = context_sequence
+            all_states = tuple(value.flatten(0, 1) for value in state_sequence)
             rewards, terminations, termination_terms = self.reward_termination(
                 all_states,
-                flatten(frames),
-                flatten(actions),
-                flatten(previous_actions),
-                flatten(contexts[1:]),
+                frame_sequence.flatten(0, 1),
+                action_sequence.flatten(0, 1),
+                previous_action_sequence.flatten(0, 1),
+                context_sequence[1:].flatten(0, 1),
             )
         if self.recovery_amp is not None:
-            prior_states = [initial_state] + states[:-1]
-            prior_flat = tuple(flatten([s[i] for s in prior_states]) for i in range(6))
-            active = flatten(contexts[:-1])[..., self.mdp.context_layout.recovery_active].squeeze(-1)
+            if self.mixed_tasks:
+                prior_states = [initial_state] + states[:-1]
+                prior_flat = tuple(flatten([s[i] for s in prior_states]) for i in range(6))
+            else:
+                prior_flat = tuple(
+                    torch.cat((initial_state[index][None], state_sequence[index][:-1]), 0).flatten(0, 1)
+                    for index in range(6)
+                )
+            active = rollout_contexts[:-1].flatten(0, 1)[
+                ..., self.mdp.context_layout.recovery_active
+            ].squeeze(-1)
             rewards = self.recovery_amp.mix_reward(
                 rewards, self.recovery_amp.reward(prior_flat, all_states, active), active
             )
@@ -1595,21 +1765,20 @@ class SuperMimicAlgorithm:
             motion = ~rollout_task_modes
             teleop = rollout_task_modes
             result["imagined_motion_reward"] = (
-                weighted_rewards[motion].mean() / 0.1
-                if motion.any()
-                else torch.zeros((), device=self.device)
+                (weighted_rewards * motion).sum() / motion.sum().clamp_min(1) / 0.1
             )
             result["imagined_teleop_reward"] = (
-                weighted_rewards[teleop].mean() / 0.1
-                if teleop.any()
-                else torch.zeros((), device=self.device)
+                (weighted_rewards * teleop).sum() / teleop.sum().clamp_min(1) / 0.1
             )
         if self.mdp.context_layout is not None:
             result["replay_recovery_ratio"] = (
                 start["xi"][..., self.mdp.context_layout.recovery_active].float().mean().detach()
             )
             result["imagined_recovery_ratio"] = (
-                torch.stack(contexts[1:])[..., self.mdp.context_layout.recovery_active].float().mean().detach()
+                rollout_contexts[1:][..., self.mdp.context_layout.recovery_active]
+                .float()
+                .mean()
+                .detach()
             )
         else:
             zero = torch.zeros((), device=self.device)

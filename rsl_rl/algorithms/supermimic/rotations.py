@@ -6,6 +6,47 @@ import torch
 import torch.nn.functional as F
 
 
+def mat33_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Multiply 3x3 matrices without dispatching tiny batched GEMMs."""
+    if not torch.compiler.is_compiling():
+        return a @ b
+    a00, a01, a02 = a[..., 0, 0], a[..., 0, 1], a[..., 0, 2]
+    a10, a11, a12 = a[..., 1, 0], a[..., 1, 1], a[..., 1, 2]
+    a20, a21, a22 = a[..., 2, 0], a[..., 2, 1], a[..., 2, 2]
+    b00, b01, b02 = b[..., 0, 0], b[..., 0, 1], b[..., 0, 2]
+    b10, b11, b12 = b[..., 1, 0], b[..., 1, 1], b[..., 1, 2]
+    b20, b21, b22 = b[..., 2, 0], b[..., 2, 1], b[..., 2, 2]
+    return torch.stack(
+        (
+            a00 * b00 + a01 * b10 + a02 * b20,
+            a00 * b01 + a01 * b11 + a02 * b21,
+            a00 * b02 + a01 * b12 + a02 * b22,
+            a10 * b00 + a11 * b10 + a12 * b20,
+            a10 * b01 + a11 * b11 + a12 * b21,
+            a10 * b02 + a11 * b12 + a12 * b22,
+            a20 * b00 + a21 * b10 + a22 * b20,
+            a20 * b01 + a21 * b11 + a22 * b21,
+            a20 * b02 + a21 * b12 + a22 * b22,
+        ),
+        dim=-1,
+    ).reshape(torch.broadcast_shapes(a.shape[:-2], b.shape[:-2]) + (3, 3))
+
+
+def mat33_vec(matrix: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+    """Multiply a 3x3 matrix by a 3-vector using fusible elementwise ops."""
+    if not torch.compiler.is_compiling():
+        return (matrix @ vector.unsqueeze(-1)).squeeze(-1)
+    x, y, z = vector.unbind(-1)
+    return torch.stack(
+        (
+            matrix[..., 0, 0] * x + matrix[..., 0, 1] * y + matrix[..., 0, 2] * z,
+            matrix[..., 1, 0] * x + matrix[..., 1, 1] * y + matrix[..., 1, 2] * z,
+            matrix[..., 2, 0] * x + matrix[..., 2, 1] * y + matrix[..., 2, 2] * z,
+        ),
+        dim=-1,
+    )
+
+
 def quat_to_mat(q: torch.Tensor) -> torch.Tensor:
     q = F.normalize(q, dim=-1)
     w, x, y, z = q.unbind(-1)
@@ -84,7 +125,7 @@ def so3_exp(v: torch.Tensor) -> torch.Tensor:
     b = torch.where(small, 0.5 - theta2 / 24, (1 - torch.cos(theta)) / (theta2 + 1e-12))
     k = skew(v)
     eye = torch.eye(3, device=v.device, dtype=v.dtype).expand(k.shape)
-    return eye + a[..., None] * k + b[..., None] * (k @ k)
+    return eye + a[..., None] * k + b[..., None] * mat33_mul(k, k)
 
 
 def quat_to_rotvec(q: torch.Tensor) -> torch.Tensor:

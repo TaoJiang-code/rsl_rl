@@ -12,11 +12,11 @@ class RecoveryMetrics:
         )
         self.pending = torch.zeros(num_envs, device=device, dtype=torch.bool)
         self.valid_steps = torch.zeros(num_envs, device=device, dtype=torch.long)
+        self.interval = torch.zeros(5, device=device, dtype=torch.float32)
         self.reset_interval()
 
     def reset_interval(self):
-        self.attempts = self.successes = self.excluded = 0
-        self.acc_sq = self.acc_count = 0
+        self.interval.zero_()
 
     @torch.no_grad()
     def update(self, state, next_state, active, episode_step, done, terminated):
@@ -31,20 +31,24 @@ class RecoveryMetrics:
         failed = self.pending & terminated
         passed = self.pending & ~done & (self.valid_steps >= self.validation_steps)
         excluded = self.pending & done & ~terminated
-        self.attempts += int((failed | passed).sum())
-        self.successes += int(passed.sum())
-        self.excluded += int(excluded.sum())
+        self.interval[0].add_((failed | passed).sum())
+        self.interval[1].add_(passed.sum())
+        self.interval[2].add_(excluded.sum())
         self.pending &= ~(failed | passed | excluded)
-        acceleration = (next_state[-1][active] - state[-1][active]) / self.dt
-        self.acc_sq += float(acceleration.square().sum())
-        self.acc_count += acceleration.numel()
+        acceleration = (next_state[-1] - state[-1]) / self.dt
+        active_weight = active.to(acceleration.dtype)[:, None]
+        self.interval[3].add_((acceleration.square() * active_weight).sum())
+        self.interval[4].add_(active.sum() * acceleration.shape[-1])
 
     def flush(self):
-        values = {"Recovery/evaluated_attempts": self.attempts,
-                  "Recovery/excluded_timeouts": self.excluded}
-        if self.attempts:
-            values["Recovery/success_rate"] = self.successes / self.attempts
-        if self.acc_count:
-            values["Recovery/joint_acceleration_rms"] = math.sqrt(self.acc_sq / self.acc_count)
+        attempts, successes, excluded, acc_sq, acc_count = self.interval.detach().cpu().tolist()
+        values = {
+            "Recovery/evaluated_attempts": attempts,
+            "Recovery/excluded_timeouts": excluded,
+        }
+        if attempts:
+            values["Recovery/success_rate"] = successes / attempts
+        if acc_count:
+            values["Recovery/joint_acceleration_rms"] = math.sqrt(acc_sq / acc_count)
         self.reset_interval()
         return values

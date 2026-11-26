@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from .rotations import axis_angle_to_mat, rpy_to_mat
+from .rotations import axis_angle_to_mat, mat33_mul, mat33_vec, rpy_to_mat
 
 
 def _vec(text: str | None, default: tuple[float, float, float]) -> list[float]:
@@ -88,19 +88,21 @@ class UrdfKinematics:
         origin_linear_velocities = [None] * count
         linear_velocities, angular_velocities = [None] * count, [None] * count
         positions[0], rotations[0] = p, rotation
-        root_com_displacement = (rotation @ self.com_offsets[0].unsqueeze(-1)).squeeze(-1)
+        root_com_displacement = mat33_vec(rotation, self.com_offsets[0])
         origin_linear_velocities[0] = v - torch.cross(w, root_com_displacement, dim=-1)
         linear_velocities[0], angular_velocities[0] = v, w
         for index in range(1, count):
             parent = self.parent[index]
             parent_rotation = rotations[parent]
-            displacement = (parent_rotation @ self.offsets[index].unsqueeze(-1)).squeeze(-1)
+            displacement = mat33_vec(parent_rotation, self.offsets[index])
             position = positions[parent] + displacement
-            offset_rotation = parent_rotation @ self.offset_rotations[index]
+            offset_rotation = mat33_mul(parent_rotation, self.offset_rotations[index])
             joint = self.joint_index[index]
             if joint >= 0:
-                child_rotation = offset_rotation @ axis_angle_to_mat(self.axes[index], q[..., joint])
-                axis_world = (offset_rotation @ self.axes[index].unsqueeze(-1)).squeeze(-1)
+                child_rotation = mat33_mul(
+                    offset_rotation, axis_angle_to_mat(self.axes[index], q[..., joint])
+                )
+                axis_world = mat33_vec(offset_rotation, self.axes[index])
                 angular_velocity = angular_velocities[parent] + axis_world * qd[..., joint : joint + 1]
             else:
                 child_rotation = offset_rotation
@@ -108,7 +110,7 @@ class UrdfKinematics:
             origin_linear_velocity = origin_linear_velocities[parent] + torch.cross(
                 angular_velocities[parent], displacement, dim=-1
             )
-            com_displacement = (child_rotation @ self.com_offsets[index].unsqueeze(-1)).squeeze(-1)
+            com_displacement = mat33_vec(child_rotation, self.com_offsets[index])
             linear_velocity = origin_linear_velocity + torch.cross(
                 angular_velocity, com_displacement, dim=-1
             )

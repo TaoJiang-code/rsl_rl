@@ -66,6 +66,44 @@ _TENSORBOARD_TAGS = {
 }
 
 
+class _DeviceMetricAccumulator:
+    """Accumulate scalar metrics on-device and synchronize only at log time."""
+
+    def __init__(self, names: tuple[str, ...], device: str):
+        self.names = names
+        self.indices = {name: index for index, name in enumerate(names)}
+        self.values = torch.zeros(len(names), 2, device=device, dtype=torch.float32)
+
+    @torch.no_grad()
+    def add(self, name: str, value: torch.Tensor | float) -> None:
+        index = self.indices[name]
+        self.values[index, 0].add_(torch.as_tensor(value, device=self.values.device).detach())
+        self.values[index, 1].add_(1.0)
+
+    @torch.no_grad()
+    def add_ratio(
+        self,
+        name: str,
+        numerator: torch.Tensor | float,
+        denominator: torch.Tensor | float,
+    ) -> None:
+        index = self.indices[name]
+        self.values[index, 0].add_(
+            torch.as_tensor(numerator, device=self.values.device).detach()
+        )
+        self.values[index, 1].add_(
+            torch.as_tensor(denominator, device=self.values.device).detach()
+        )
+
+    def snapshot(self) -> dict[str, float]:
+        host = self.values.detach().cpu()
+        means = host[:, 0] / host[:, 1].clamp_min(1.0)
+        return {name: float(means[index]) for index, name in enumerate(self.names)}
+
+    def reset(self) -> None:
+        self.values.zero_()
+
+
 class SuperMimicRunner:
     """Collect real transitions, fit dynamics, and optimize the policy through imagined rollouts."""
 
@@ -320,7 +358,7 @@ class SuperMimicRunner:
         self.git_status_repos.append(repo_file_path)
 
     @torch.no_grad()
-    def _collect(self, steps: int, statistics: dict[str, list[float]]) -> None:
+    def _collect(self, steps: int, statistics: _DeviceMetricAccumulator) -> None:
         for _ in range(steps):
             state_flat = self.unwrapped.supermimic_state().clone()
             state = unflatten_state(state_flat)
@@ -405,8 +443,11 @@ class SuperMimicRunner:
             if self.algorithm.recovery_amp is not None:
                 active = context[:, self.unwrapped.supermimic_context_layout.recovery_active].squeeze(-1)
                 style = self.algorithm.recovery_amp.reward(state, unflatten_state(transition["s1"]), active)
-                statistics["recovery_amp_reward"].append(
-                    float(style[active > 0].mean()) if (active > 0).any() else 0.0
+                active_mask = active > 0
+                statistics.add_ratio(
+                    "recovery_amp_reward",
+                    (style * active_mask).sum(),
+                    active_mask.sum(),
                 )
                 reward = self.algorithm.recovery_amp.mix_reward(reward, style, active)
                 transition["r"] = reward
@@ -419,41 +460,52 @@ class SuperMimicRunner:
                 teleop_task=teleop_task,
             )
             self.sim_steps += self.env.num_envs
-            statistics["sim_reward"].append(float(reward.mean() / 0.1))
+            statistics.add("sim_reward", reward.mean() / 0.1)
             if self.mixed_tasks:
-                if (~teleop_task).any():
-                    statistics["sim_motion_reward"].append(
-                        float(reward[~teleop_task].mean() / 0.1)
-                    )
-                if teleop_task.any():
-                    statistics["sim_teleop_reward"].append(
-                        float(reward[teleop_task].mean() / 0.1)
-                    )
+                motion_mask = ~teleop_task
+                statistics.add_ratio(
+                    "sim_motion_reward",
+                    (reward * motion_mask).sum() / 0.1,
+                    motion_mask.sum(),
+                )
+                statistics.add_ratio(
+                    "sim_teleop_reward",
+                    (reward * teleop_task).sum() / 0.1,
+                    teleop_task.sum(),
+                )
             recovery_active = (
                 context[:, self.unwrapped.supermimic_context_layout.recovery_active].squeeze(-1) > 0
                 if self.unwrapped.supermimic_context_layout is not None
                 else torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
             )
-            statistics["recovery_ratio"].append(float(recovery_active.float().mean()))
+            statistics.add("recovery_ratio", recovery_active.float().mean())
             tracking_mask = ~recovery_active
-            if tracking_mask.any():
-                statistics["tracking_error"].append(
-                    float(transition_info["tracking_error"][tracking_mask].mean())
-                )
-            statistics["sampling_mean_tracking_error"].append(
-                float(self.motion.metrics["sampling_mean_tracking_error"].mean())
+            statistics.add_ratio(
+                "tracking_error",
+                (transition_info["tracking_error"] * tracking_mask).sum(),
+                tracking_mask.sum(),
             )
-            if done.any():
-                ids = done.bool().nonzero(as_tuple=False).squeeze(-1)
-                statistics["episode_length"].append(float((episode_step[ids] + 1).float().mean()))
-                statistics["termination_count"].append(float(terminated[ids].float().sum()))
-                statistics["done_count"].append(float(ids.numel()))
-                normalized = transition_info["normalized_return"][ids]
-                statistics["normalized_return"].append(float(normalized.mean()))
-
-    @staticmethod
-    def _mean(values: list) -> float:
-        return sum(float(value) for value in values) / max(len(values), 1)
+            statistics.add(
+                "sampling_mean_tracking_error",
+                self.motion.metrics["sampling_mean_tracking_error"].mean(),
+            )
+            done_mask = done.bool()
+            done_count = done_mask.sum()
+            statistics.add_ratio(
+                "episode_length",
+                ((episode_step + 1).float() * done_mask).sum(),
+                done_count,
+            )
+            statistics.add_ratio(
+                "normalized_return",
+                (transition_info["normalized_return"] * done_mask).sum(),
+                done_count,
+            )
+            statistics.add_ratio(
+                "termination_fraction",
+                (terminated & done_mask).float().sum(),
+                done_count,
+            )
 
     def _open_logging(self, resume: bool) -> None:
         from torch.utils.tensorboard import SummaryWriter
@@ -513,49 +565,41 @@ class SuperMimicRunner:
             self._csv_file.flush()
 
     def _log(self, iteration: int, elapsed: float, interval_elapsed: float, stats, aggregate, learning_rate):
-        termination_fraction = sum(stats["termination_count"]) / max(sum(stats["done_count"]), 1.0)
+        stats = stats.snapshot()
+        aggregate = aggregate.snapshot()
+        termination_fraction = stats["termination_fraction"]
         row = {
             "iteration": iteration,
             "wall_h": elapsed / 3600,
             "sim_steps": self.sim_steps,
-            "world_model_loss": self._mean(aggregate["world_model_loss"]),
-            "world_model_error_8": self._mean(aggregate["world_model_error_8"]),
-            "policy_loss": self._mean(aggregate["policy_loss"]),
-            "critic_loss": self._mean(aggregate["critic_loss"]),
-            "imagined_reward": self._mean(aggregate["imagined_reward"]),
-            "policy_gradient_norm": self._mean(aggregate["policy_gradient_norm"]),
-            "self_imitation_loss": self._mean(aggregate["self_imitation_loss"]),
-            "self_imitation_positive_ratio": self._mean(
-                aggregate["self_imitation_positive_ratio"]
-            ),
-            "gradient_consistency_error": self._mean(
-                aggregate["gradient_consistency_error"]
-            ),
-            "gradient_consistency_cosine": self._mean(
-                aggregate["gradient_consistency_cosine"]
-            ),
-            "imagined_survival": self._mean(aggregate["imagined_survival"]),
-            "imagined_motion_reward": self._mean(aggregate["imagined_motion_reward"]),
-            "imagined_teleop_reward": self._mean(aggregate["imagined_teleop_reward"]),
-            "real_recovery_ratio": self._mean(stats["recovery_ratio"]),
-            "replay_recovery_ratio": self._mean(aggregate["replay_recovery_ratio"]),
-            "imagined_recovery_ratio": self._mean(aggregate["imagined_recovery_ratio"]),
-            "valid_imagined_start_ratio": self._mean(aggregate["valid_imagined_start_ratio"]),
-            "soft_termination_height": self._mean(aggregate["soft_termination_height"]),
-            "soft_termination_tilt": self._mean(aggregate["soft_termination_tilt"]),
-            "soft_termination_end_effector": self._mean(
-                aggregate["soft_termination_end_effector"]
-            ),
+            "world_model_loss": aggregate["world_model_loss"],
+            "world_model_error_8": aggregate["world_model_error_8"],
+            "policy_loss": aggregate["policy_loss"],
+            "critic_loss": aggregate["critic_loss"],
+            "imagined_reward": aggregate["imagined_reward"],
+            "policy_gradient_norm": aggregate["policy_gradient_norm"],
+            "self_imitation_loss": aggregate["self_imitation_loss"],
+            "self_imitation_positive_ratio": aggregate["self_imitation_positive_ratio"],
+            "gradient_consistency_error": aggregate["gradient_consistency_error"],
+            "gradient_consistency_cosine": aggregate["gradient_consistency_cosine"],
+            "imagined_survival": aggregate["imagined_survival"],
+            "imagined_motion_reward": aggregate["imagined_motion_reward"],
+            "imagined_teleop_reward": aggregate["imagined_teleop_reward"],
+            "real_recovery_ratio": stats["recovery_ratio"],
+            "replay_recovery_ratio": aggregate["replay_recovery_ratio"],
+            "imagined_recovery_ratio": aggregate["imagined_recovery_ratio"],
+            "valid_imagined_start_ratio": aggregate["valid_imagined_start_ratio"],
+            "soft_termination_height": aggregate["soft_termination_height"],
+            "soft_termination_tilt": aggregate["soft_termination_tilt"],
+            "soft_termination_end_effector": aggregate["soft_termination_end_effector"],
             "recovery_assist_anneal": float(self.motion.recovery_assist_anneal),
-            "tracking_error": self._mean(stats["tracking_error"]),
-            "sampling_mean_tracking_error": self._mean(
-                stats["sampling_mean_tracking_error"]
-            ),
-            "sim_reward": self._mean(stats["sim_reward"]),
-            "sim_motion_reward": self._mean(stats["sim_motion_reward"]),
-            "sim_teleop_reward": self._mean(stats["sim_teleop_reward"]),
-            "episode_length": self._mean(stats["episode_length"]),
-            "normalized_return": self._mean(stats["normalized_return"]),
+            "tracking_error": stats["tracking_error"],
+            "sampling_mean_tracking_error": stats["sampling_mean_tracking_error"],
+            "sim_reward": stats["sim_reward"],
+            "sim_motion_reward": stats["sim_motion_reward"],
+            "sim_teleop_reward": stats["sim_teleop_reward"],
+            "episode_length": stats["episode_length"],
+            "normalized_return": stats["normalized_return"],
             "termination_fraction": termination_fraction,
             "iterations_per_second": int(self.algorithm_cfg["log_interval"]) / interval_elapsed,
             "learning_rate": learning_rate,
@@ -565,21 +609,19 @@ class SuperMimicRunner:
                 {
                     "training_stage": self.algorithm.training_stage,
                     "velocity_warmup_completed": self.algorithm.velocity_warmup_completed,
-                    "motion_policy_loss": self._mean(aggregate["motion_policy_loss"]),
-                    "teleop_policy_loss": self._mean(aggregate["teleop_policy_loss"]),
-                    "alignment_loss": self._mean(aggregate["alignment_loss"]),
-                    "switch_action_continuity_loss": self._mean(
-                        aggregate["switch_action_continuity_loss"]
-                    ),
-                    "motion_critic_loss": self._mean(aggregate["motion_critic_loss"]),
-                    "velocity_critic_loss": self._mean(
-                        aggregate["velocity_critic_loss"]
-                    ),
+                    "motion_policy_loss": aggregate["motion_policy_loss"],
+                    "teleop_policy_loss": aggregate["teleop_policy_loss"],
+                    "alignment_loss": aggregate["alignment_loss"],
+                    "switch_action_continuity_loss": aggregate["switch_action_continuity_loss"],
+                    "motion_critic_loss": aggregate["motion_critic_loss"],
+                    "velocity_critic_loss": aggregate["velocity_critic_loss"],
                 }
             )
         if self.algorithm.recovery_amp is not None:
-            row["recovery_amp_loss"] = self.algorithm.recovery_amp.last_loss
-            row["recovery_amp_reward"] = self._mean(stats["recovery_amp_reward"])
+            row["recovery_amp_loss"] = float(
+                self.algorithm.recovery_amp.last_loss.detach().cpu()
+            )
+            row["recovery_amp_reward"] = stats["recovery_amp_reward"]
         row = {name: row[name] for name in self._csv_writer.fieldnames}
         self._csv_writer.writerow(row)
         self._csv_file.flush()
@@ -589,8 +631,14 @@ class SuperMimicRunner:
         for tag, value in self.recovery_metrics.flush().items():
             self.writer.add_scalar(tag, value, iteration)
         if self.algorithm.recovery_amp is not None and self.algorithm.recovery_amp.updates:
-            self.writer.add_scalar("AMP/expert_score", self.algorithm.recovery_amp.expert_score, iteration)
-            self.writer.add_scalar("AMP/policy_score", self.algorithm.recovery_amp.policy_score, iteration)
+            amp_scores = torch.stack(
+                (
+                    self.algorithm.recovery_amp.expert_score,
+                    self.algorithm.recovery_amp.policy_score,
+                )
+            ).detach().cpu()
+            self.writer.add_scalar("AMP/expert_score", float(amp_scores[0]), iteration)
+            self.writer.add_scalar("AMP/policy_score", float(amp_scores[1]), iteration)
         stage_text = (
             f"{row['training_stage']} "
             f"{row['velocity_warmup_completed']}/"
@@ -623,29 +671,27 @@ class SuperMimicRunner:
                 "Pass --motion_checkpoint <model.pt>, or resume an existing mixed run."
             )
         warmup_steps = max(int(self.algorithm_cfg["warmup_steps"]), self.algorithm.world_model_window)
-        stats = {
-            name: []
-            for name in (
+        stats = _DeviceMetricAccumulator(
+            (
                 "sim_reward",
                 "sim_motion_reward",
                 "sim_teleop_reward",
                 "episode_length",
                 "normalized_return",
-                "termination_count",
-                "done_count",
+                "termination_fraction",
                 "recovery_ratio",
                 "tracking_error",
                 "recovery_amp_reward",
                 "sampling_mean_tracking_error",
-            )
-        }
+            ),
+            self.device,
+        )
         print(f"[INFO] Filling SuperMimic replay with {warmup_steps} simulator steps.")
         self._collect(warmup_steps, stats)
         self._open_logging(resume=self.current_learning_iteration > 0)
 
-        aggregate = {
-            name: []
-            for name in (
+        aggregate = _DeviceMetricAccumulator(
+            (
                 "world_model_loss",
                 "world_model_error_8",
                 "policy_loss",
@@ -671,8 +717,9 @@ class SuperMimicRunner:
                 "soft_termination_height",
                 "soft_termination_tilt",
                 "soft_termination_end_effector",
-            )
-        }
+            ),
+            self.device,
+        )
         start_time = time.time() - self.wall_time_offset
         interval_start = time.time()
         step_accumulator = 0.0
@@ -693,12 +740,13 @@ class SuperMimicRunner:
                     )
                 for _ in range(int(self.algorithm_cfg["world_model_batches"])):
                     loss, error = self.algorithm.world_model_update()
-                aggregate["world_model_loss"].append(float(loss))
-                aggregate["world_model_error_8"].append(float(error))
+                self.algorithm.seal_replay_prefetch()
+                aggregate.add("world_model_loss", loss)
+                aggregate.add("world_model_error_8", error)
                 if iteration >= int(self.algorithm_cfg["world_model_only_iterations"]):
                     result = self.algorithm.policy_update()
                     for name, value in result.items():
-                        aggregate[name].append(float(value))
+                        aggregate.add(name, value)
                 self.current_learning_iteration = iteration + 1
                 if self.current_learning_iteration % int(self.algorithm_cfg["log_interval"]) == 0:
                     now = time.time()
@@ -711,8 +759,8 @@ class SuperMimicRunner:
                         learning_rate,
                     )
                     interval_start = now
-                    stats = {name: [] for name in stats}
-                    aggregate = {name: [] for name in aggregate}
+                    stats.reset()
+                    aggregate.reset()
                 if self.current_learning_iteration % int(self.cfg["save_interval"]) == 0:
                     self.wall_time_offset = time.time() - start_time
                     self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))

@@ -44,29 +44,28 @@ class RecoveryAMP:
         )
         with torch.no_grad():
             self.expert = invariant_features(unflatten_state(expert)).detach()
-        self.starts = []
-        for start, end in zip(motion.recovery_clip_starts.tolist(), motion.recovery_clip_ends.tolist()):
-            if end <= start:
-                raise ValueError("AMP expert clips require at least two frames.")
-            self.starts.append(torch.arange(start, end, device=device))
+        self.clip_starts = motion.recovery_clip_starts.to(device)
+        self.clip_lengths = (motion.recovery_clip_ends - motion.recovery_clip_starts).to(device)
+        if torch.any(self.clip_lengths <= 0):
+            raise ValueError("AMP expert clips require at least two frames.")
         self.norm = RunningNorm(self.expert.shape[-1]).to(device)
         self.norm.update(self.expert)
         self.discriminator = Discriminator(2 * self.expert.shape[-1], hidden_dims=(512, 256), device=device)
-        self.optimizer = torch.optim.Adam(
-            self.discriminator.parameters(), lr=float(cfg.get("recovery_amp_learning_rate", 1e-4))
-        )
+        optimizer_kwargs = {"lr": float(cfg.get("recovery_amp_learning_rate", 1e-4))}
+        if bool(cfg.get("fused_optimizer", True)) and str(device).startswith("cuda"):
+            optimizer_kwargs["fused"] = True
+        self.optimizer = torch.optim.Adam(self.discriminator.parameters(), **optimizer_kwargs)
         self.updates = 0
-        self.last_loss = 0.0
-        self.expert_score = self.policy_score = 0.0
+        self.last_loss = torch.zeros((), device=device)
+        self.expert_score = torch.zeros((), device=device)
+        self.policy_score = torch.zeros((), device=device)
         self.discriminator.requires_grad_(False)
 
     def sample_expert(self, count: int):
         # Sample clips uniformly, then frames within each clip; short clips remain represented.
-        clips = torch.randint(len(self.starts), (count,), device=self.expert.device)
-        indices = torch.empty_like(clips)
-        for index, starts in enumerate(self.starts):
-            mask = clips == index
-            indices[mask] = starts[torch.randint(len(starts), (int(mask.sum()),), device=clips.device)]
+        clips = torch.randint(self.clip_starts.numel(), (count,), device=self.expert.device)
+        offsets = (torch.rand(count, device=self.expert.device) * self.clip_lengths[clips]).long()
+        indices = self.clip_starts[clips] + offsets
         return self.expert[indices], self.expert[indices + 1]
 
     def reward(self, state, next_state, active: torch.Tensor) -> torch.Tensor:
@@ -109,8 +108,8 @@ class RecoveryAMP:
         try:
             policy_logits = self.discriminator(torch.cat((first, second), -1))
             expert_logits = self.discriminator(torch.cat((expert, expert_next), -1))
-            self.expert_score = float(expert_logits.detach().mean())
-            self.policy_score = float(policy_logits.detach().mean())
+            self.expert_score = expert_logits.detach().mean()
+            self.policy_score = policy_logits.detach().mean()
             loss = 0.5 * (
                 F.mse_loss(policy_logits, -torch.ones_like(policy_logits))
                 + F.mse_loss(expert_logits, torch.ones_like(expert_logits))
@@ -119,7 +118,7 @@ class RecoveryAMP:
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.optimizer.step()
-            self.last_loss = float(loss.detach())
+            self.last_loss = loss.detach()
             self.updates += 1
         finally:
             self.optimizer.zero_grad(set_to_none=True)
