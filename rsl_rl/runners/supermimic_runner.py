@@ -318,6 +318,9 @@ class SuperMimicRunner:
         )
         self.algorithm_cfg["control_dt"] = float(self.unwrapped.step_dt)
         self.algorithm_cfg["action_scale"] = action_scale.flatten().cpu().tolist()
+        self.algorithm_cfg["reference_action_skip"] = bool(
+            getattr(self.action_term.cfg, "reference_action_skip", False)
+        )
         task_switch_mean = self.unwrapped.cfg.task_switch_mean_time_s
         self.algorithm_cfg["task_switch_probability"] = (
             0.0

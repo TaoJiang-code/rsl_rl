@@ -220,6 +220,7 @@ class Policy(nn.Module):
         history_length: int = 10,
         latent_dim: int = 32,
         teleop_goal_dim: int | None = None,
+        reference_action_skip: tuple[int, torch.Tensor, torch.Tensor] | None = None,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -227,6 +228,27 @@ class Policy(nn.Module):
         self.action_dim = action_dim
         self.history_length = history_length
         self.teleop_goal_dim = teleop_goal_dim
+        self.motion_reference_action_offset = -1
+        if reference_action_skip is not None:
+            offset, default_joint_position, action_scale = reference_action_skip
+            default_joint_position = torch.as_tensor(
+                default_joint_position, dtype=torch.float32
+            ).flatten()
+            action_scale = torch.as_tensor(action_scale, dtype=torch.float32).flatten()
+            if (
+                default_joint_position.numel() != action_dim
+                or action_scale.numel() != action_dim
+            ):
+                raise ValueError(
+                    "Reference-action skip default pose and scale must match the action dimension."
+                )
+            if torch.any(action_scale == 0.0):
+                raise ValueError("Reference-action skip requires non-zero action scales.")
+            self.motion_reference_action_offset = int(offset)
+            self.register_buffer(
+                "reference_default_joint_position", default_joint_position.clone()
+            )
+            self.register_buffer("reference_action_scale", action_scale.clone())
         self.encoder = mlp(goal_dim, [2048, 1024, 512, 256], latent_dim)
         self.teleop_encoder = (
             None
@@ -247,6 +269,19 @@ class Policy(nn.Module):
         observation = self.obs_norm(observation_history).flatten(-2)
         return run_mlp(self.decoder, torch.cat((latent, observation), -1))
 
+    def _apply_reference_action_skip(
+        self,
+        residual: torch.Tensor,
+        goal: torch.Tensor,
+        offset: int,
+    ) -> torch.Tensor:
+        if offset < 0:
+            return residual
+        reference_joint_position = goal[..., offset : offset + self.action_dim]
+        return residual + (
+            reference_joint_position - self.reference_default_joint_position
+        ) / self.reference_action_scale
+
     def encode_motion(self, goal: torch.Tensor) -> torch.Tensor:
         return torch.tanh(run_mlp(self.encoder, self.goal_norm(goal)))
 
@@ -261,7 +296,10 @@ class Policy(nn.Module):
         return self._decode(observation_history, latent)
 
     def forward(self, observation_history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
-        return self._decode(observation_history, self.encode_motion(goal))
+        residual = self._decode(observation_history, self.encode_motion(goal))
+        return self._apply_reference_action_skip(
+            residual, goal, self.motion_reference_action_offset
+        )
 
     def forward_teleop(
         self,
@@ -280,7 +318,13 @@ class Policy(nn.Module):
         motion_latent = self.encode_motion(motion_goal)
         teleop_latent = self.encode_teleop(teleop_goal)
         latent = torch.where(teleop_task.bool().unsqueeze(-1), teleop_latent, motion_latent)
-        return self._decode(observation_history, latent)
+        residual = self._decode(observation_history, latent)
+        motion_action = self._apply_reference_action_skip(
+            residual, motion_goal, self.motion_reference_action_offset
+        )
+        return torch.where(
+            teleop_task.bool().unsqueeze(-1), residual, motion_action
+        )
 
 
 class Critic(nn.Module):

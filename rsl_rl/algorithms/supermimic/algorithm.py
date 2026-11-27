@@ -84,6 +84,15 @@ class SuperMimicAlgorithm:
             self.robot_spec.num_joints,
             self.history_length,
             teleop_goal_dim=teleop_goal_dim,
+            reference_action_skip=(
+                (
+                    self.robot_spec.goal_joint_position_offset,
+                    self.mdp.default_joint_position,
+                    self.mdp.action_scale,
+                )
+                if bool(cfg.get("reference_action_skip", False))
+                else None
+            ),
         ).to(device)
         self.critic = Critic(critic_dim).to(device)
         self.recovery_amp = None
@@ -1850,6 +1859,9 @@ class SuperMimicAlgorithm:
             "recovery_amp": None if self.recovery_amp is None else self.recovery_amp.state_dict(),
             "robot_spec": self.robot_spec.to_dict(),
             "mixed_tasks": self.mixed_tasks,
+            "reference_action_skip": bool(
+                self.cfg.get("reference_action_skip", False)
+            ),
             "world_model_structured": self.structured_world_model,
             "world_model": self.world_model.state_dict(),
             "policy": inference_policy.state_dict(),
@@ -1894,6 +1906,16 @@ class SuperMimicAlgorithm:
             )
         if bool(state.get("mixed_tasks", False)):
             raise ValueError("Expected a full-reference checkpoint, but received a mixed-task checkpoint.")
+        saved_reference_action_skip = bool(state.get("reference_action_skip", False))
+        current_reference_action_skip = bool(
+            self.cfg.get("reference_action_skip", False)
+        )
+        if saved_reference_action_skip != current_reference_action_skip:
+            raise ValueError(
+                "Motion checkpoint action semantics do not match this run: "
+                f"checkpoint reference_action_skip={saved_reference_action_skip}, "
+                f"current={current_reference_action_skip}."
+            )
         saved_structured = bool(state.get("world_model_structured", False))
         if saved_structured != self.structured_world_model:
             raise ValueError(
@@ -1941,6 +1963,17 @@ class SuperMimicAlgorithm:
             raise ValueError(
                 "Checkpoint task interface does not match the current environment: "
                 f"checkpoint mixed_tasks={saved_mixed_tasks}, current={self.mixed_tasks}."
+            )
+        saved_reference_action_skip = bool(state.get("reference_action_skip", False))
+        current_reference_action_skip = bool(
+            self.cfg.get("reference_action_skip", False)
+        )
+        if saved_reference_action_skip != current_reference_action_skip:
+            raise ValueError(
+                "Checkpoint action semantics do not match the current environment: "
+                f"checkpoint reference_action_skip={saved_reference_action_skip}, "
+                f"current={current_reference_action_skip}. Start a new run after changing "
+                "between default-centered and reference-residual actions."
             )
         saved_structured = bool(state.get("world_model_structured", False))
         if saved_structured != self.structured_world_model:

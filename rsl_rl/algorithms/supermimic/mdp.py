@@ -57,6 +57,11 @@ class SuperMimicRobotSpec:
         return 15 + 2 * self.num_joints
 
     @property
+    def goal_joint_position_offset(self) -> int:
+        """Offset of the first future frame's joint positions in a motion goal."""
+        return 15
+
+    @property
     def invariant_dim(self) -> int:
         return 13 + 2 * self.num_joints
 

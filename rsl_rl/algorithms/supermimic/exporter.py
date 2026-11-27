@@ -102,6 +102,11 @@ def export_supermimic_policy(
             "goal": ["batch", goal_dim],
         },
         "outputs": {"action": ["batch", robot_spec.num_joints]},
+        "action_semantics": (
+            "normalized_reference_plus_residual"
+            if getattr(policy, "motion_reference_action_offset", -1) >= 0
+            else "normalized_default_centered_target"
+        ),
         "observation_layout": [
             f"joint_position_relative:{robot_spec.num_joints}",
             f"joint_velocity:{robot_spec.num_joints}",

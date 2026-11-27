@@ -166,6 +166,7 @@ def test_q1_robot_spec_dimensions():
     assert spec.observation_dim == 78
     assert spec.context_dim == 26
     assert spec.goal_step_dim == 59
+    assert spec.goal_joint_position_offset == 15
     assert spec.state_increment_dim == 56
     assert spec.critic_extra_dim == 93
     assert spec.goal_dim(10) == 590
@@ -231,6 +232,31 @@ def test_mixed_policy_and_replay_dimensions():
     assert start["teleop_task"].dtype == torch.bool
     assert start["reference_yaw_rotation"].shape == (8, 3, 3)
     assert start["reference_translation"].shape == (8, 3)
+
+
+def test_policy_reference_action_skip_uses_first_future_joint_pose():
+    action_dim = 2
+    offset = 3
+    default = torch.tensor([0.2, -0.4])
+    scale = torch.tensor([0.5, 0.25])
+    policy = Policy(
+        obs_dim=8,
+        goal_dim=12,
+        action_dim=action_dim,
+        history_length=2,
+        reference_action_skip=(offset, default, scale),
+    )
+    history = torch.randn(4, 2, 8)
+    goal = torch.randn(4, 12)
+    goal[:, offset : offset + action_dim] = torch.tensor([0.7, -0.1])
+    residual = policy.decode(history, policy.encode_motion(goal))
+    expected = residual + (goal[:, offset : offset + action_dim] - default) / scale
+    action = policy(history, goal)
+    torch.testing.assert_close(action, expected)
+    torch.testing.assert_close(
+        default + scale * action,
+        goal[:, offset : offset + action_dim] + scale * residual,
+    )
 
 
 def test_teleop_to_motion_reanchor_is_frozen_and_preserves_reference_delta():
