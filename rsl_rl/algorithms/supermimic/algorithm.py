@@ -229,7 +229,11 @@ class SuperMimicAlgorithm:
             self.imagination_chunk = torch.compile(
                 self._motion_imagination_chunk, **reusable_output_compile_options
             )
-            self.reward_termination = torch.compile(self._reward_termination, **compile_options)
+            # Outputs survive further reward calls in value-gradient targets and are
+            # logged after backward; reduce-overhead CUDA Graph buffers are not safe here.
+            self.reward_termination = torch.compile(
+                self._reward_termination, **reusable_output_compile_options
+            )
             self.critic_input = torch.compile(
                 self._critic_input, **reusable_output_compile_options
             )
@@ -245,7 +249,7 @@ class SuperMimicAlgorithm:
                     self._mixed_imagination_step, **reusable_output_compile_options
                 )
                 self.reward_termination = torch.compile(
-                    self._mixed_reward_termination, **compile_options
+                    self._mixed_reward_termination, **reusable_output_compile_options
                 )
         print(
             "[INFO] SuperMimic GPU execution: "
